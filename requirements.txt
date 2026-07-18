@@ -1,38 +1,40 @@
-# PySpark
-pyspark==3.5.0
-
-# ML
-xgboost==2.0.3
-scikit-learn==1.4.0
+# ============================================
+# CRITICAL PINS — do not casually upgrade these.
+# These exact versions resolve real numpy/pandas/torch
+# ABI conflicts hit during development. Upgrading any of
+# them individually can reintroduce those crashes.
+# ============================================
+numpy==1.26.4
+pandas==2.0.3
+pyarrow==12.0.1
+scipy==1.11.4
+pyspark==3.5.1
 shap==0.44.0
-optuna==3.5.0
-
-# MLOps
-mlflow==2.10.0
-dvc==3.38.1
-
-# HuggingFace
 transformers==4.38.0
 sentence-transformers==2.4.0
-huggingface-hub==0.21.0
 
-# LangChain + Agents (baad mein)
-langchain==0.1.9
-langgraph==0.0.26
-langchain-community==0.0.24
-groq==0.4.2
+# Torch must be installed SEPARATELY from the CPU-only index
+# (a plain `pip install torch` can pull an incompatible/CUDA
+# build). Run this one command by itself:
+#   pip install torch==2.2.2 --index-url https://download.pytorch.org/whl/cpu
 
-# Data
-pandas==2.2.0
-numpy==1.26.4
-matplotlib==3.8.2
-seaborn==0.13.2
+# ── ML / Training ──
+xgboost
+scikit-learn
+optuna
+mlflow
+joblib
+matplotlib
+seaborn
 
-# RAG (baad mein)
-faiss-cpu==1.7.4
+# ── RAG / Agents ──
+faiss-cpu
+huggingface_hub
+langgraph
+python-dotenv
 
-# Report
-fpdf2==2.7.6
-streamlit==1.31.0
-python-dotenv==1.0.1
-#export KAGGLE_API_TOKEN=KGAT_696273e6da49ef1013a0e277347395f8
+# ── Data source ──
+ucimlrepo
+
+# ── Deployment ──
+streamlit
