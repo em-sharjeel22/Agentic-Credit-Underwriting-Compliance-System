@@ -1,0 +1,38 @@
+# PySpark
+pyspark==3.5.0
+
+# ML
+xgboost==2.0.3
+scikit-learn==1.4.0
+shap==0.44.0
+optuna==3.5.0
+
+# MLOps
+mlflow==2.10.0
+dvc==3.38.1
+
+# HuggingFace
+transformers==4.38.0
+sentence-transformers==2.4.0
+huggingface-hub==0.21.0
+
+# LangChain + Agents (baad mein)
+langchain==0.1.9
+langgraph==0.0.26
+langchain-community==0.0.24
+groq==0.4.2
+
+# Data
+pandas==2.2.0
+numpy==1.26.4
+matplotlib==3.8.2
+seaborn==0.13.2
+
+# RAG (baad mein)
+faiss-cpu==1.7.4
+
+# Report
+fpdf2==2.7.6
+streamlit==1.31.0
+python-dotenv==1.0.1
+#export KAGGLE_API_TOKEN=KGAT_696273e6da49ef1013a0e277347395f8
