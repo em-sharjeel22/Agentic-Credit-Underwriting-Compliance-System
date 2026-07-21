@@ -1,28 +1,68 @@
+"""
+Sentinel - Agentic Credit Underwriting & Compliance System
+
+Live Streamlit dashboard: enter an applicant's profile and get a
+real-time risk score, a SHAP explanation for that specific applicant,
+and an SBP regulatory compliance check - all computed live from the
+form inputs, not pre-generated.
+"""
+
+import os
 import json
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+import joblib
+import pandas as pd
+import xgboost as xgb
 import faiss
-import numpy as np
+import matplotlib.pyplot as plt
 import streamlit as st
 from sentence_transformers import SentenceTransformer
+from huggingface_hub import InferenceClient
 
+# ── Paths ──────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "models" / "credit_model.pkl"
 KB_DIR = BASE_DIR / "data" / "knowledge_base"
-REPORTS_DIR = BASE_DIR / "reports"
 INDEX_PATH = KB_DIR / "faiss_index.bin"
 METADATA_PATH = KB_DIR / "chunk_metadata.json"
-MODEL_NAME = "all-MiniLM-L6-v2"
+REPORTS_DIR = BASE_DIR / "reports"
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 
-st.set_page_config(page_title="SBP Consumer Financing Assistant", page_icon="🏦", layout="wide")
+# SBP Regulation R-8 thresholds, hardcoded from the source document so
+# the numeric compliance check is deterministic rather than LLM-guessed.
+SBP_R8_PERSONAL_CLEAN_CAP = 2_000_000
+SBP_R8_AGGREGATE_CAP = 5_000_000
+
+st.set_page_config(page_title="Sentinel - Credit Underwriting", page_icon="🏦", layout="wide")
 
 
-def load_css() -> None:
+def get_groq_key():
+    """Streamlit Cloud uses st.secrets; local dev falls back to an environment variable."""
+    try:
+        if "GROQ_API_KEY" in st.secrets:
+            return st.secrets["GROQ_API_KEY"]
+    except Exception:
+        pass
+    return os.environ.get("GROQ_API_KEY")
+
+
+def load_css():
     st.markdown(
         """
         <style>
-        .block-container {
-            padding-top: 1rem;
-            padding-bottom: 1rem;
+        .stApp { background: linear-gradient(135deg, #f4f9ff 0%, #eaf4ff 100%); }
+        .block-container { padding-top: 2rem; padding-bottom: 2rem; }
+        .hero-card {
+            background: linear-gradient(90deg, #0f5fb7 0%, #3d8ed9 100%);
+            padding: 1.5rem 1.6rem; border-radius: 16px; color: white;
+            box-shadow: 0 10px 25px rgba(15, 95, 183, 0.16);
         }
         </style>
         """,
@@ -33,145 +73,309 @@ def load_css() -> None:
 load_css()
 
 
-@st.cache_resource(show_spinner=False)
-def load_vectorstore():
-    if not INDEX_PATH.exists() or not METADATA_PATH.exists():
-        st.error("Knowledge base files are missing. Run the pipeline first.")
-        st.stop()
+@st.cache_resource(show_spinner="Loading risk model...")
+def load_risk_model():
+    bundle = joblib.load(MODEL_PATH)
+    return bundle["model"], bundle["threshold"]
 
+
+@st.cache_resource(show_spinner="Loading compliance knowledge base...")
+def load_compliance_resources():
     index = faiss.read_index(str(INDEX_PATH))
-    with open(METADATA_PATH, "r", encoding="utf-8") as handle:
-        chunks = json.load(handle)
-
-    try:
-        model = SentenceTransformer(MODEL_NAME)
-    except Exception:
-        model = None
-
-    return index, chunks, model
+    with open(METADATA_PATH, "r", encoding="utf-8") as f:
+        chunks = json.load(f)
+    embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    return index, chunks, embed_model
 
 
-def build_local_query_vector(query: str) -> np.ndarray:
-    tokens = [token.lower() for token in query.replace("\n", " ").split() if token]
-    vector = np.zeros(64, dtype="float32")
-    for token in tokens:
-        index = abs(hash(token)) % 64
-        vector[index] += 1.0
-    norm = np.linalg.norm(vector)
-    if norm > 0:
-        vector = vector / norm
-    return vector
+@st.cache_resource(show_spinner=False)
+def load_llm_client():
+    key = get_groq_key()
+    if not key:
+        return None
+    return InferenceClient(provider="groq", api_key=key)
 
 
-def search(query: str, index, chunks, model, top_k: int = 5):
-    try:
-        if model is not None:
-            query_vector = model.encode([query], convert_to_numpy=True).astype("float32")
-        else:
-            query_vector = build_local_query_vector(query).reshape(1, -1)
-    except Exception:
-        query_vector = build_local_query_vector(query).reshape(1, -1)
+# ── Agent logic ────────────────────────────────────────────
+# Kept self-contained in this file on purpose: importing from src/agents/
+# would add a cross-folder dependency that is fragile on a fresh cloud
+# checkout. Each function below plays the same role as the matching
+# agent in src/agents/orchestrator.py.
 
-    distances, indices = index.search(query_vector, top_k)
-    return [
-        {
-            "rank": rank + 1,
-            "section": chunks[item]["section"],
-            "text": chunks[item]["text"],
-            "distance": float(distances[0][rank]),
-        }
-        for rank, item in enumerate(indices[0])
-    ]
+def engineer_features(raw: dict) -> dict:
+    """Turns the 23 raw fields into the same engineered features used at training time."""
+    bill_cols = [raw[f"BILL_AMT{i}"] for i in range(1, 7)]
+    pay_amt_cols = [raw[f"PAY_AMT{i}"] for i in range(1, 7)]
+    pay_status_cols = [raw["PAY_0"]] + [raw[f"PAY_{i}"] for i in range(2, 7)]
 
+    avg_bill = sum(bill_cols) / 6
+    utilization_ratio = round(avg_bill / raw["LIMIT_BAL"], 4) if raw["LIMIT_BAL"] else 0.0
+    avg_pay_delay = round(sum(pay_status_cols) / 6, 3)
+    max_pay_delay = max(pay_status_cols)
+    months_late = sum(1 for p in pay_status_cols if p > 0)
+    total_paid = sum(pay_amt_cols)
+    total_billed = sum(bill_cols)
+    payment_ratio = round(total_paid / total_billed, 4) if total_billed > 0 else 1.0
+    delay_trend = raw["PAY_0"] - raw["PAY_6"]
 
-def discover_reports():
-    supported = [".png", ".jpg", ".jpeg"]
-    report_files = []
-    for ext in supported:
-        report_files.extend(REPORTS_DIR.glob(f"*{ext}"))
-    return sorted(report_files, key=lambda path: path.name)
-
-
-def render_report_gallery(report_files):
-    if not report_files:
-        st.info("No report images were found in the reports folder yet.")
-        return
-
-    descriptions = {
-        "confusion_matrix.png": "Confusion matrix showing the model's classification outcomes.",
-        "correlation_heatmap.png": "Correlation heatmap for the most important predictive variables.",
-        "income_distribution.png": "Distribution of applicant income across the dataset.",
-        "missing_values.png": "Missing-value profile to highlight the quality of the training data.",
-        "shap_feature_importance.png": "SHAP-based feature importance for the risk model.",
-        "shap_summary.png": "SHAP summary plot showing how features influence the model output.",
-        "target_distribution.png": "Distribution of the target outcome for the dataset.",
+    return {
+        **raw,
+        "utilization_ratio": utilization_ratio,
+        "avg_pay_delay": avg_pay_delay,
+        "max_pay_delay": max_pay_delay,
+        "months_late": months_late,
+        "payment_ratio": payment_ratio,
+        "delay_trend": delay_trend,
     }
 
-    columns = st.columns(2)
-    for index, path in enumerate(report_files):
-        with columns[index % 2]:
-            st.image(str(path), caption=descriptions.get(path.name, "Model evaluation report."), use_container_width=True)
-            st.caption(path.name)
+
+def run_data_agent(raw: dict) -> dict:
+    """Validates the applicant's numbers and flags any SBP R-8 exposure-cap breaches."""
+    warnings = []
+    if raw.get("LIMIT_BAL", 0) <= 0:
+        warnings.append("LIMIT_BAL is zero or negative.")
+    if not (18 <= raw.get("AGE", 0) <= 100):
+        warnings.append("AGE is outside the plausible range (18-100).")
+    if raw.get("EDUCATION") not in [1, 2, 3, 4]:
+        warnings.append("EDUCATION code is not in the expected set (1-4).")
+    if raw.get("MARRIAGE") not in [1, 2, 3]:
+        warnings.append("MARRIAGE code is not in the expected set (1-3).")
+
+    limit_bal = raw.get("LIMIT_BAL", 0)
+    sbp_flags = {
+        "exceeds_r8_personal_clean_cap": limit_bal > SBP_R8_PERSONAL_CLEAN_CAP,
+        "exceeds_r8_aggregate_cap": limit_bal > SBP_R8_AGGREGATE_CAP,
+    }
+    return {"warnings": warnings, "sbp_flags": sbp_flags}
 
 
-st.title("SBP Consumer Financing Assistant")
-st.caption("A professional Streamlit dashboard for searching regulation references and reviewing the credit-risk model reports.")
+def run_risk_agent(model, threshold, applicant: dict):
+    """Scores the applicant and returns SHAP contributions computed natively by XGBoost
+    (via pred_contribs), which avoids the shap library's fragile model-format parser."""
+    feature_names = model.get_booster().feature_names
+    X = pd.DataFrame([applicant])[feature_names]
 
+    proba = float(model.predict_proba(X)[0, 1])
+    decision = "REJECT" if proba >= threshold else "APPROVE"
+
+    booster = model.get_booster()
+    dmatrix = xgb.DMatrix(X, feature_names=feature_names)
+    raw_contribs = booster.predict(dmatrix, pred_contribs=True)
+    shap_values = raw_contribs[0, :-1]
+
+    contributions = sorted(
+        zip(feature_names, shap_values, X.iloc[0].values),
+        key=lambda x: abs(x[1]), reverse=True,
+    )
+    return proba, decision, contributions
+
+
+def run_compliance_agent(index, chunks, embed_model, llm_client, applicant, decision, sbp_flags):
+    """Retrieves the most relevant SBP regulation(s) and asks the LLM to explain them
+    in plain language, citing the regulation number."""
+    if sbp_flags.get("exceeds_r8_aggregate_cap"):
+        query = (
+            "What SBP regulation applies when a customer's aggregate clean "
+            "credit card and personal loan exposure exceeds Rs 5,000,000?"
+        )
+    elif sbp_flags.get("exceeds_r8_personal_clean_cap"):
+        query = (
+            "What SBP regulation applies when a customer's clean credit "
+            "card limit exceeds Rs 2,000,000?"
+        )
+    else:
+        query = (
+            f"What SBP regulations apply when a bank {decision.lower()}s a consumer "
+            f"financing application with credit limit {applicant.get('LIMIT_BAL', 'N/A')}?"
+        )
+
+    query_vector = embed_model.encode([query], convert_to_numpy=True).astype("float32")
+    distances, indices = index.search(query_vector, 3)
+    retrieved = [chunks[i] for i in indices[0]]
+    context = "\n\n".join(f"[{c['section']}]\n{c['text']}" for c in retrieved)
+    sources = [c["section"] for c in retrieved]
+
+    if llm_client is None:
+        return (
+            "LLM is not configured (missing GROQ_API_KEY). Showing the raw retrieved "
+            "regulation text instead:\n\n" + context,
+            sources,
+        )
+
+    completion = llm_client.chat.completions.create(
+        model="meta-llama/Llama-3.3-70B-Instruct",
+        messages=[
+            {"role": "system", "content": (
+                "You are an SBP compliance officer. Answer ONLY using the regulation "
+                "text provided below. Always cite the regulation number."
+            )},
+            {"role": "user", "content": f"Regulations:\n{context}\n\nQuestion: {query}"},
+        ],
+        temperature=0.1,
+    )
+    return completion.choices[0].message.content, sources
+
+
+# ── Live chart builders ────────────────────────────────────
+
+def render_shap_chart(contributions):
+    """Bar chart of THIS applicant's top SHAP factors - recomputed on every submission."""
+    top = contributions[:8]
+    labels = [f[0] for f in top][::-1]
+    values = [f[1] for f in top][::-1]
+    colors = ["#d64545" if v > 0 else "#2f9e58" for v in values]
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.barh(labels, values, color=colors)
+    ax.axvline(0, color="#333333", linewidth=0.8)
+    ax.set_xlabel("Impact on default risk (SHAP value)")
+    ax.set_title("Why the model reached this score")
+    fig.tight_layout()
+    return fig
+
+
+def payment_history_dataframe(applicant):
+    """Six-month bill/payment series built directly from the form inputs."""
+    months = ["M-6", "M-5", "M-4", "M-3", "M-2", "M-1 (latest)"]
+    bills = [applicant[f"BILL_AMT{i}"] for i in range(6, 0, -1)]
+    payments = [applicant[f"PAY_AMT{i}"] for i in range(6, 0, -1)]
+    return pd.DataFrame({"Bill amount": bills, "Amount paid": payments}, index=months)
+
+
+# ── UI ─────────────────────────────────────────────────────
+
+st.markdown(
+    """
+    <div class="hero-card">
+        <h1 style="margin-bottom:0.2rem;">Sentinel - Credit Underwriting</h1>
+        <p style="margin:0; font-size:1.02rem;">Live risk scoring, per-applicant SHAP
+        explanations, and SBP compliance checking.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 st.markdown("")
 
-index, chunks, model = load_vectorstore()
-report_files = discover_reports()
+model, threshold = load_risk_model()
+index, chunks, embed_model = load_compliance_resources()
+llm_client = load_llm_client()
 
-with st.sidebar:
-    st.header("Search the regulations", divider="blue")
-    st.markdown("<div style='font-size:0.95rem; color:#245a96;'>Ask a regulation question and retrieve the most relevant passages from the local knowledge base.</div>", unsafe_allow_html=True)
-    query = st.text_area(
-        "Ask a question about the regulations",
-        value="What is the maximum tenure for auto financing?",
-        height=140,
+live_tab, reports_tab = st.tabs(["Live Underwriting", "Model Training Reports"])
+
+with live_tab:
+    st.subheader("Applicant profile")
+    st.caption(
+        "Enter an applicant's details and click Analyze. Every chart below is "
+        "computed live from these exact numbers."
     )
-    top_k = st.slider("Number of results", min_value=1, max_value=8, value=3)
-    run = st.button("Search", use_container_width=True)
 
-    st.markdown("")
-    st.caption("Reference sources: local knowledge base and report images in the repository.")
+    with st.form("applicant_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            limit_bal = st.number_input("Credit limit (LIMIT_BAL)", min_value=0, value=50000, step=1000)
+            age = st.number_input("Age", min_value=18, max_value=100, value=35)
+        with c2:
+            sex = st.selectbox("Sex", options=[1, 2], format_func=lambda x: "Male" if x == 1 else "Female")
+            education = st.selectbox(
+                "Education", options=[1, 2, 3, 4],
+                format_func=lambda x: {1: "Graduate school", 2: "University", 3: "High school", 4: "Other"}[x],
+            )
+        with c3:
+            marriage = st.selectbox(
+                "Marital status", options=[1, 2, 3],
+                format_func=lambda x: {1: "Married", 2: "Single", 3: "Other"}[x],
+            )
 
-overview, search_tab, reports_tab = st.tabs(["Overview", "Regulation search", "Model reports"])
+        st.markdown("**Repayment status, last 6 months** (-1 = paid on time, 1+ = months late)")
+        pay_cols = st.columns(6)
+        pay_labels = ["PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"]
+        pay_values = []
+        for col, label in zip(pay_cols, pay_labels):
+            with col:
+                pay_values.append(st.number_input(label, min_value=-2, max_value=9, value=0, key=label))
 
-with overview:
-    st.subheader("How this interface works")
-    st.write("The app combines a local knowledge base of SBP regulation chunks with a lightweight FAISS search layer. The search results are shown together with the relevant section text so the response is grounded in the project data.")
+        st.markdown("**Bill amount, last 6 months**")
+        bill_cols_ui = st.columns(6)
+        bill_values = []
+        for i, col in enumerate(bill_cols_ui, start=1):
+            with col:
+                bill_values.append(st.number_input(f"BILL_AMT{i}", min_value=0, value=10000, key=f"bill_{i}"))
 
-    st.markdown("")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Knowledge-base chunks", len(chunks))
-    col2.metric("Report images", len(report_files))
-    col3.metric("Search index", "FAISS")
+        st.markdown("**Amount paid, last 6 months**")
+        payamt_cols_ui = st.columns(6)
+        payamt_values = []
+        for i, col in enumerate(payamt_cols_ui, start=1):
+            with col:
+                payamt_values.append(st.number_input(f"PAY_AMT{i}", min_value=0, value=2000, key=f"payamt_{i}"))
 
-    st.markdown("")
-    st.subheader("Data reference and explanation")
-    st.write(
-        "The dataset was sourced from the State Bank of Pakistan's Prudential Regulations for Consumer Financing. Since the SBP website restricts automated web scraping, the document was retrieved manually and cached locally. The complete retrieval process and data provenance are documented in sbp_consumer_financing_source.txt."
-    )
-    st.write("The search experience is intentionally grounded in repository data rather than external web sources.")
+        submitted = st.form_submit_button("Analyze", use_container_width=True)
 
-with search_tab:
-    if run:
-        with st.spinner("Searching the knowledge base..."):
-            results = search(query, index, chunks, model, top_k=top_k)
+    if submitted:
+        raw_applicant = {
+            "LIMIT_BAL": limit_bal, "SEX": sex, "EDUCATION": education,
+            "MARRIAGE": marriage, "AGE": age,
+            "PAY_0": pay_values[0], "PAY_2": pay_values[1], "PAY_3": pay_values[2],
+            "PAY_4": pay_values[3], "PAY_5": pay_values[4], "PAY_6": pay_values[5],
+        }
+        for i in range(1, 7):
+            raw_applicant[f"BILL_AMT{i}"] = bill_values[i - 1]
+            raw_applicant[f"PAY_AMT{i}"] = payamt_values[i - 1]
 
-        st.subheader("Search results")
-        if not results:
-            st.info("No results found for that query.")
-        else:
-            for result in results:
-                with st.expander(f"{result['rank']}. {result['section']}", expanded=(result['rank'] == 1)):
-                    st.write(result["text"][:1800])
-                    st.caption(f"Similarity distance: {result['distance']:.3f}")
-    else:
-        st.info("Enter a question in the sidebar and press Search to retrieve relevant regulation text.")
+        data_result = run_data_agent(raw_applicant)
+        applicant = engineer_features(raw_applicant)
+        proba, decision, contributions = run_risk_agent(model, threshold, applicant)
+        compliance_answer, compliance_sources = run_compliance_agent(
+            index, chunks, embed_model, llm_client, applicant, decision, data_result["sbp_flags"]
+        )
+
+        for w in data_result["warnings"]:
+            st.warning(w)
+
+        st.markdown("---")
+        res1, res2 = st.columns([1, 2])
+
+        with res1:
+            st.metric("Default probability", f"{proba * 100:.1f}%")
+            if decision == "APPROVE":
+                st.success(f"Decision: {decision}")
+            else:
+                st.error(f"Decision: {decision}")
+            st.progress(min(proba, 1.0))
+
+            st.markdown("**Payment history (live)**")
+            st.line_chart(payment_history_dataframe(applicant))
+
+        with res2:
+            st.markdown("**Why this score (live SHAP explanation)**")
+            fig = render_shap_chart(contributions)
+            st.pyplot(fig)
+
+        st.markdown("---")
+        st.markdown("**Compliance check**")
+        st.write(compliance_answer)
+        st.caption(f"Sources: {', '.join(compliance_sources)}")
 
 with reports_tab:
-    st.subheader("Model and analysis reports")
-    st.write("The following figures provide a professional summary of the underlying credit-risk workflow and the data used for training and evaluation.")
-    render_report_gallery(report_files)
+    st.subheader("Model training reports")
+    st.caption(
+        "These figures describe the overall model, generated once during training - "
+        "they do not change with the applicant form above."
+    )
+
+    descriptions = {
+        "confusion_matrix.png": "Confusion matrix on the held-out test set.",
+        "correlation_heatmap.png": "Correlation heatmap of the key predictive variables.",
+        "shap_feature_importance.png": "Overall SHAP feature importance across all test applicants.",
+        "shap_summary.png": "SHAP summary plot across the whole test set.",
+        "target_distribution.png": "Distribution of the target outcome in the training data.",
+        "missing_values.png": "Missing-value profile of the training data.",
+    }
+
+    report_files = sorted(REPORTS_DIR.glob("*.png")) if REPORTS_DIR.exists() else []
+    if not report_files:
+        st.info("No report images found in the reports/ folder.")
+    else:
+        cols = st.columns(2)
+        for i, path in enumerate(report_files):
+            with cols[i % 2]:
+                st.image(str(path), caption=descriptions.get(path.name, path.name), use_container_width=True)

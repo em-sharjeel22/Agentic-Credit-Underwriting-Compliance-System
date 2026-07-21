@@ -1,0 +1,45 @@
+# ============================================
+# LOCAL TRAINING requirements — for running the data pipeline,
+# model training, and agent development on your own machine.
+# NOT used by Streamlit Cloud (it reads requirements.txt).
+#
+# CRITICAL PINS — do not casually upgrade these.
+# These exact versions resolve real numpy/pandas/torch ABI
+# conflicts hit during development on Windows. Upgrading any one
+# of them individually can reintroduce those crashes.
+# ============================================
+numpy==1.26.4
+pandas==2.0.3
+pyarrow==12.0.1
+scipy==1.11.4
+pyspark==3.5.1
+shap==0.44.0
+transformers==4.38.0
+sentence-transformers==2.4.0
+
+# Torch must be installed SEPARATELY from the CPU-only index
+# (a plain `pip install torch` can pull an incompatible/CUDA build):
+#   pip install torch==2.2.2 --index-url https://download.pytorch.org/whl/cpu
+
+# ── ML / Training ──
+xgboost
+scikit-learn
+optuna
+mlflow
+joblib
+matplotlib
+seaborn
+
+# ── RAG / Agents ──
+faiss-cpu
+huggingface_hub
+langgraph
+python-dotenv
+
+# ── Data source ──
+ucimlrepo
+
+# ── API / Deployment tooling ──
+fastapi
+uvicorn
+streamlit
