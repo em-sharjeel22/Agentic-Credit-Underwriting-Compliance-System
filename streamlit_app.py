@@ -253,12 +253,53 @@ def render_shap_chart(contributions):
     return fig
 
 
+def verify_summary_citations(polished_summary: str, compliance_sources: list) -> bool:
+    """Lightweight hallucination guard: checks that every 'REGULATION X-N' the
+    polished memo cites was actually among the retrieved sources. This catches
+    the highest-stakes failure mode (inventing a compliance citation) even
+    though the summary step is only asked to rephrase, not add new facts."""
+    import re
+    cited = {c.upper() for c in re.findall(r"REGULATION\s+[RO]-\d+", polished_summary, re.IGNORECASE)}
+    sources = {s.upper() for s in compliance_sources}
+    return cited.issubset(sources)
+
+
 def payment_history_dataframe(applicant):
-    """Six-month bill/payment series built directly from the form inputs."""
+    """Six-month bill/payment AMOUNT series built directly from the form inputs."""
     months = ["M-6", "M-5", "M-4", "M-3", "M-2", "M-1 (latest)"]
     bills = [applicant[f"BILL_AMT{i}"] for i in range(6, 0, -1)]
     payments = [applicant[f"PAY_AMT{i}"] for i in range(6, 0, -1)]
     return pd.DataFrame({"Bill amount": bills, "Amount paid": payments}, index=months)
+
+
+def repayment_status_dataframe(applicant):
+    """Six-month repayment STATUS series - a different lens from the amounts
+    chart above: this shows behavior (on-time vs. months late), which is what
+    max_pay_delay and delay_trend are actually derived from."""
+    months = ["M-6", "M-5", "M-4", "M-3", "M-2", "M-1 (latest)"]
+    status = [
+        applicant["PAY_6"], applicant["PAY_5"], applicant["PAY_4"],
+        applicant["PAY_3"], applicant["PAY_2"], applicant["PAY_0"],
+    ]
+    return pd.DataFrame({"Repayment status (-1=on time, 1+=months late)": status}, index=months)
+
+
+def payment_delay_dataframe(applicant):
+    """Delay-status series across the same six months, oldest to newest —
+    a behavior-pattern view, distinct from the dollar-amount view above."""
+    months = ["M-6", "M-5", "M-4", "M-3", "M-2", "M-1 (latest)"]
+    delay_keys = ["PAY_6", "PAY_5", "PAY_4", "PAY_3", "PAY_2", "PAY_0"]
+    delays = [applicant[k] for k in delay_keys]
+    return pd.DataFrame({"Payment delay (months)": delays}, index=months)
+
+
+def limit_vs_sbp_caps_dataframe(applicant):
+    """Where this applicant's requested limit sits relative to the two
+    SBP R-8 exposure caps — a compliance-context view."""
+    return pd.DataFrame(
+        {"Amount (PKR)": [applicant["LIMIT_BAL"], SBP_R8_PERSONAL_CLEAN_CAP, SBP_R8_AGGREGATE_CAP]},
+        index=["Applicant's limit", "SBP clean cap (R-8)", "SBP aggregate cap (R-8)"],
+    )
 
 
 # ── UI ─────────────────────────────────────────────────────
@@ -358,9 +399,25 @@ with live_tab:
         if polished_summary:
             st.markdown("---")
             st.markdown("**Underwriting memo**")
+            if not verify_summary_citations(polished_summary, compliance_sources):
+                st.warning(
+                    "This summary may reference a regulation that was not actually "
+                    "retrieved — verify against the Compliance check section below."
+                )
             st.info(polished_summary)
 
         st.markdown("---")
+        st.markdown("**Engineered features** (computed live from the 6-month history)")
+        engineered_names = [
+            "utilization_ratio", "avg_pay_delay", "max_pay_delay",
+            "months_late", "payment_ratio", "delay_trend",
+        ]
+        engineered_df = pd.DataFrame({
+            "Feature": engineered_names,
+            "Value": [applicant[name] for name in engineered_names],
+        })
+        st.dataframe(engineered_df, hide_index=True, use_container_width=True)
+
         res1, res2 = st.columns([1, 2])
 
         with res1:
@@ -371,13 +428,19 @@ with live_tab:
                 st.error(f"Decision: {decision}")
             st.progress(min(proba, 1.0))
 
-            st.markdown("**Payment history (live)**")
+            st.markdown(f"**Credit utilization: {applicant['utilization_ratio'] * 100:.1f}%**")
+            st.progress(min(applicant["utilization_ratio"], 1.0))
+
+            st.markdown("**Payment amounts (live)**")
             st.line_chart(payment_history_dataframe(applicant))
 
         with res2:
             st.markdown("**Why this score (live SHAP explanation)**")
             fig = render_shap_chart(contributions)
             st.pyplot(fig)
+
+            st.markdown("**Repayment status trend (live)**")
+            st.bar_chart(repayment_status_dataframe(applicant))
 
         st.markdown("---")
         st.markdown("**Compliance check**")
