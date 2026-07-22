@@ -53,26 +53,6 @@ def get_groq_key():
     return os.environ.get("GROQ_API_KEY")
 
 
-def load_css():
-    st.markdown(
-        """
-        <style>
-        .stApp { background: linear-gradient(135deg, #f4f9ff 0%, #eaf4ff 100%); }
-        .block-container { padding-top: 2rem; padding-bottom: 2rem; }
-        .hero-card {
-            background: linear-gradient(90deg, #0f5fb7 0%, #3d8ed9 100%);
-            padding: 1.5rem 1.6rem; border-radius: 16px; color: white;
-            box-shadow: 0 10px 25px rgba(15, 95, 183, 0.16);
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-load_css()
-
-
 @st.cache_resource(show_spinner="Loading risk model...")
 def load_risk_model():
     bundle = joblib.load(MODEL_PATH)
@@ -170,27 +150,13 @@ def run_risk_agent(model, threshold, applicant: dict):
     return proba, decision, contributions
 
 
-def run_compliance_agent(index, chunks, embed_model, llm_client, applicant, decision, sbp_flags):
-    """Retrieves the most relevant SBP regulation(s) and asks the LLM to explain them
-    in plain language, citing the regulation number."""
-    if sbp_flags.get("exceeds_r8_aggregate_cap"):
-        query = (
-            "What SBP regulation applies when a customer's aggregate clean "
-            "credit card and personal loan exposure exceeds Rs 5,000,000?"
-        )
-    elif sbp_flags.get("exceeds_r8_personal_clean_cap"):
-        query = (
-            "What SBP regulation applies when a customer's clean credit "
-            "card limit exceeds Rs 2,000,000?"
-        )
-    else:
-        query = (
-            f"What SBP regulations apply when a bank {decision.lower()}s a consumer "
-            f"financing application with credit limit {applicant.get('LIMIT_BAL', 'N/A')}?"
-        )
-
+def retrieve_and_answer(query, index, chunks, embed_model, llm_client, top_k=3):
+    """Shared retrieval + LLM-answer logic. Used by BOTH the compliance agent
+    (triggered automatically from an applicant's data) and the standalone
+    regulation chatbot (free-form questions typed by the user) - so both entry
+    points are backed by the exact same compliance engine."""
     query_vector = embed_model.encode([query], convert_to_numpy=True).astype("float32")
-    distances, indices = index.search(query_vector, 3)
+    distances, indices = index.search(query_vector, top_k)
     retrieved = [chunks[i] for i in indices[0]]
     context = "\n\n".join(f"[{c['section']}]\n{c['text']}" for c in retrieved)
     sources = [c["section"] for c in retrieved]
@@ -214,6 +180,27 @@ def run_compliance_agent(index, chunks, embed_model, llm_client, applicant, deci
         temperature=0.1,
     )
     return completion.choices[0].message.content, sources
+
+
+def run_compliance_agent(index, chunks, embed_model, llm_client, applicant, decision, sbp_flags):
+    """Builds an applicant-specific compliance question, then delegates to
+    retrieve_and_answer for the actual retrieval + generation."""
+    if sbp_flags.get("exceeds_r8_aggregate_cap"):
+        query = (
+            "What SBP regulation applies when a customer's aggregate clean "
+            "credit card and personal loan exposure exceeds Rs 5,000,000?"
+        )
+    elif sbp_flags.get("exceeds_r8_personal_clean_cap"):
+        query = (
+            "What SBP regulation applies when a customer's clean credit "
+            "card limit exceeds Rs 2,000,000?"
+        )
+    else:
+        query = (
+            f"What SBP regulations apply when a bank {decision.lower()}s a consumer "
+            f"financing application with credit limit {applicant.get('LIMIT_BAL', 'N/A')}?"
+        )
+    return retrieve_and_answer(query, index, chunks, embed_model, llm_client)
 
 
 # ── Live chart builders ────────────────────────────────────
@@ -260,7 +247,9 @@ model, threshold = load_risk_model()
 index, chunks, embed_model = load_compliance_resources()
 llm_client = load_llm_client()
 
-live_tab, reports_tab = st.tabs(["Live Underwriting", "Model Training Reports"])
+live_tab, chat_tab, reports_tab = st.tabs(
+    ["Live Underwriting", "Ask about Regulations", "Model Training Reports"]
+)
 
 with live_tab:
     st.subheader("Applicant profile")
@@ -354,6 +343,38 @@ with live_tab:
         st.markdown("**Compliance check**")
         st.write(compliance_answer)
         st.caption(f"Sources: {', '.join(compliance_sources)}")
+
+with chat_tab:
+    st.subheader("Ask about SBP regulations")
+    st.caption(
+        "Ask any question about the SBP Prudential Regulations for Consumer "
+        "Financing directly - independent of the applicant form."
+    )
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+            if msg.get("sources"):
+                st.caption(f"Sources: {', '.join(msg['sources'])}")
+
+    question = st.chat_input("e.g. What is the maximum tenure for auto financing?")
+    if question:
+        st.session_state.chat_history.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.write(question)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Searching regulations..."):
+                answer, sources = retrieve_and_answer(question, index, chunks, embed_model, llm_client)
+            st.write(answer)
+            st.caption(f"Sources: {', '.join(sources)}")
+
+        st.session_state.chat_history.append(
+            {"role": "assistant", "content": answer, "sources": sources}
+        )
 
 with reports_tab:
     st.subheader("Model training reports")
