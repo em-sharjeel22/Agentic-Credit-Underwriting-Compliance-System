@@ -203,6 +203,38 @@ def run_compliance_agent(index, chunks, embed_model, llm_client, applicant, deci
     return retrieve_and_answer(query, index, chunks, embed_model, llm_client)
 
 
+def run_reporting_agent(llm_client, decision, proba, contributions, compliance_answer):
+    """Synthesizes the Risk Agent and Compliance Agent outputs into one polished,
+    human-readable underwriting memo. Uses only the facts already produced by
+    the other agents - it summarizes, it does not add new information."""
+    if llm_client is None:
+        return None
+
+    factors_text = ", ".join(
+        f"{f[0]} ({'raises' if f[1] > 0 else 'lowers'} risk)" for f in contributions[:5]
+    )
+
+    completion = llm_client.chat.completions.create(
+        model="meta-llama/Llama-3.3-70B-Instruct",
+        messages=[
+            {"role": "system", "content": (
+                "You are a senior credit underwriting officer writing a short "
+                "decision memo for a bank manager. Combine the risk assessment "
+                "and compliance findings into 3-4 clear sentences. Use only the "
+                "facts given below - never invent numbers or regulations."
+            )},
+            {"role": "user", "content": (
+                f"Decision: {decision}\n"
+                f"Default probability: {proba * 100:.1f}%\n"
+                f"Key factors: {factors_text}\n"
+                f"Compliance findings: {compliance_answer}"
+            )},
+        ],
+        temperature=0.2,
+    )
+    return completion.choices[0].message.content
+
+
 # ── Live chart builders ────────────────────────────────────
 
 def render_shap_chart(contributions):
@@ -316,9 +348,17 @@ with live_tab:
         compliance_answer, compliance_sources = run_compliance_agent(
             index, chunks, embed_model, llm_client, applicant, decision, data_result["sbp_flags"]
         )
+        polished_summary = run_reporting_agent(
+            llm_client, decision, proba, contributions, compliance_answer
+        )
 
         for w in data_result["warnings"]:
             st.warning(w)
+
+        if polished_summary:
+            st.markdown("---")
+            st.markdown("**Underwriting memo**")
+            st.info(polished_summary)
 
         st.markdown("---")
         res1, res2 = st.columns([1, 2])
