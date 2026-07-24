@@ -40,6 +40,29 @@ EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 SBP_R8_PERSONAL_CLEAN_CAP = 2_000_000
 SBP_R8_AGGREGATE_CAP = 5_000_000
 
+# Shared category labels - used both in the form's dropdowns and in the
+# human-readable applicant summary shown with the results.
+SEX_LABELS = {1: "Male", 2: "Female"}
+EDUCATION_LABELS = {1: "Graduate school", 2: "University", 3: "High school", 4: "Other"}
+MARRIAGE_LABELS = {1: "Married", 2: "Single", 3: "Other"}
+
+# Groups the 29 model features into three broad underwriting categories,
+# so results can be read at a "what kind of factor" level, not just a
+# feature-by-feature level.
+FEATURE_CATEGORIES = {
+    "Demographics": {"SEX", "EDUCATION", "MARRIAGE", "AGE"},
+    "Repayment Behavior": {
+        "PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6",
+        "max_pay_delay", "avg_pay_delay", "months_late", "delay_trend",
+    },
+    "Financial Capacity": {
+        "LIMIT_BAL",
+        "BILL_AMT1", "BILL_AMT2", "BILL_AMT3", "BILL_AMT4", "BILL_AMT5", "BILL_AMT6",
+        "PAY_AMT1", "PAY_AMT2", "PAY_AMT3", "PAY_AMT4", "PAY_AMT5", "PAY_AMT6",
+        "utilization_ratio", "payment_ratio",
+    },
+}
+
 st.set_page_config(page_title="Sentinel - Credit Underwriting", page_icon="🏦", layout="wide")
 
 
@@ -284,22 +307,51 @@ def repayment_status_dataframe(applicant):
     return pd.DataFrame({"Repayment status (-1=on time, 1+=months late)": status}, index=months)
 
 
-def payment_delay_dataframe(applicant):
-    """Delay-status series across the same six months, oldest to newest —
-    a behavior-pattern view, distinct from the dollar-amount view above."""
-    months = ["M-6", "M-5", "M-4", "M-3", "M-2", "M-1 (latest)"]
-    delay_keys = ["PAY_6", "PAY_5", "PAY_4", "PAY_3", "PAY_2", "PAY_0"]
-    delays = [applicant[k] for k in delay_keys]
-    return pd.DataFrame({"Payment delay (months)": delays}, index=months)
-
-
 def limit_vs_sbp_caps_dataframe(applicant):
     """Where this applicant's requested limit sits relative to the two
-    SBP R-8 exposure caps — a compliance-context view."""
+    SBP R-8 exposure caps - a compliance-context view."""
     return pd.DataFrame(
         {"Amount (PKR)": [applicant["LIMIT_BAL"], SBP_R8_PERSONAL_CLEAN_CAP, SBP_R8_AGGREGATE_CAP]},
         index=["Applicant's limit", "SBP clean cap (R-8)", "SBP aggregate cap (R-8)"],
     )
+
+
+def applicant_summary_line(applicant):
+    """Human-readable summary using the same category labels shown in the
+    form - makes the categorical inputs legible instead of raw numeric codes."""
+    sex = SEX_LABELS.get(applicant.get("SEX"), "Unknown")
+    education = EDUCATION_LABELS.get(applicant.get("EDUCATION"), "Unknown")
+    marriage = MARRIAGE_LABELS.get(applicant.get("MARRIAGE"), "Unknown")
+    age = applicant.get("AGE", "Unknown")
+    return f"{sex}, {age} years old, {education}, {marriage}"
+
+
+def categorize_contributions(contributions):
+    """Groups the individual SHAP factors into the three FEATURE_CATEGORIES
+    and sums each category's net impact - a category can matter even when
+    no single feature inside it stands out on its own."""
+    totals = {name: 0.0 for name in FEATURE_CATEGORIES}
+    for feature, shap_value, _ in contributions:
+        for category, members in FEATURE_CATEGORIES.items():
+            if feature in members:
+                totals[category] += shap_value
+                break
+    return totals
+
+
+def render_category_chart(category_totals):
+    """Bar chart of net risk impact per broad category, for THIS applicant."""
+    labels = list(category_totals.keys())
+    values = list(category_totals.values())
+    colors = ["#d64545" if v > 0 else "#2f9e58" for v in values]
+
+    fig, ax = plt.subplots(figsize=(6, 2.6))
+    ax.barh(labels, values, color=colors)
+    ax.axvline(0, color="#333333", linewidth=0.8)
+    ax.set_xlabel("Net impact on default risk (summed SHAP)")
+    ax.set_title("Risk by feature category")
+    fig.tight_layout()
+    return fig
 
 
 # ── UI ─────────────────────────────────────────────────────
@@ -337,15 +389,13 @@ with live_tab:
             limit_bal = st.number_input("Credit limit (LIMIT_BAL)", min_value=0, value=50000, step=1000)
             age = st.number_input("Age", min_value=18, max_value=100, value=35)
         with c2:
-            sex = st.selectbox("Sex", options=[1, 2], format_func=lambda x: "Male" if x == 1 else "Female")
+            sex = st.selectbox("Sex", options=[1, 2], format_func=lambda x: SEX_LABELS[x])
             education = st.selectbox(
-                "Education", options=[1, 2, 3, 4],
-                format_func=lambda x: {1: "Graduate school", 2: "University", 3: "High school", 4: "Other"}[x],
+                "Education", options=[1, 2, 3, 4], format_func=lambda x: EDUCATION_LABELS[x]
             )
         with c3:
             marriage = st.selectbox(
-                "Marital status", options=[1, 2, 3],
-                format_func=lambda x: {1: "Married", 2: "Single", 3: "Other"}[x],
+                "Marital status", options=[1, 2, 3], format_func=lambda x: MARRIAGE_LABELS[x]
             )
 
         st.markdown("**Repayment status, last 6 months** (-1 = paid on time, 1+ = months late)")
@@ -396,6 +446,8 @@ with live_tab:
         for w in data_result["warnings"]:
             st.warning(w)
 
+        st.caption(applicant_summary_line(raw_applicant))
+
         if polished_summary:
             st.markdown("---")
             st.markdown("**Underwriting memo**")
@@ -441,6 +493,16 @@ with live_tab:
 
             st.markdown("**Repayment status trend (live)**")
             st.bar_chart(repayment_status_dataframe(applicant))
+
+        st.markdown("---")
+        cat1, cat2 = st.columns(2)
+        with cat1:
+            st.markdown("**Risk by feature category (live)**")
+            category_totals = categorize_contributions(contributions)
+            st.pyplot(render_category_chart(category_totals))
+        with cat2:
+            st.markdown("**Requested limit vs. SBP caps (live)**")
+            st.bar_chart(limit_vs_sbp_caps_dataframe(applicant))
 
         st.markdown("---")
         st.markdown("**Compliance check**")
