@@ -109,8 +109,7 @@ def health_check():
 
 @app.post("/underwrite", response_model=UnderwritingResponse)
 def underwrite(applicant: ApplicantRequest):
-    from orchestrator import engineer_features   # lightweight — module already cached
-
+    from features import engineer_features
     applicant_dict = engineer_features(applicant.model_dump())
 
     try:
