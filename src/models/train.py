@@ -15,6 +15,7 @@ import optuna
 import mlflow
 import mlflow.xgboost
 import joblib
+import json 
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_val_predict
@@ -144,6 +145,8 @@ def evaluate_model(model, X_test, y_test, threshold):
     naive_baseline = max(y_test.value_counts(normalize=True))
     print(f"\n📏 Naive Baseline (hamesha majority class bolna): {naive_baseline:.4f}")
     print("📈 Hamara Model:")
+    
+    
     for name, value in metrics.items():
         print(f"   {name.upper():12s}: {value:.4f}")
 
@@ -158,6 +161,10 @@ def evaluate_model(model, X_test, y_test, threshold):
     plt.savefig(os.path.join(REPORTS_DIR, "confusion_matrix.png"), dpi=150)
     plt.close()
     print("\n📊 Chart saved → reports/confusion_matrix.png")
+    metrics_path = os.path.join(REPORTS_DIR, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump({**metrics, "naive_baseline": naive_baseline}, f, indent=2)
+    print(f"💾 Metrics saved → {metrics_path}")
 
     return metrics, naive_baseline
 

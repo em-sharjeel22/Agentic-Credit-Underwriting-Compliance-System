@@ -1,0 +1,31 @@
+stages:
+  preprocess:
+    cmd: python src/spark/preprocessing.py
+    deps:
+      - src/spark/preprocessing.py
+      - data/raw/credit_card_default.csv
+    outs:
+      - data/processed/train.csv
+      - data/processed/test.csv
+
+  train:
+    cmd: python src/models/train.py
+    deps:
+      - src/models/train.py
+      - data/processed/train.csv
+      - data/processed/test.csv
+    outs:
+      - models/credit_model.pkl
+    metrics:
+      - reports/metrics.json:
+          cache: false
+
+  explain:
+    cmd: python src/models/explainability.py
+    deps:
+      - src/models/explainability.py
+      - models/credit_model.pkl
+      - data/processed/test.csv
+    outs:
+      - reports/shap_summary.png
+      - reports/shap_feature_importance.png

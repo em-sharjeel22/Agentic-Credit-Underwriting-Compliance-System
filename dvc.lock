@@ -1,0 +1,70 @@
+schema: '2.0'
+stages:
+  preprocess:
+    cmd: python src/spark/preprocessing.py
+    deps:
+    - path: data/raw/credit_card_default.csv
+      hash: md5
+      md5: 7a5ec1ad489e620a5326d1798b076beb
+      size: 2728292
+    - path: src/spark/preprocessing.py
+      hash: md5
+      md5: c690a89f7cab4cde6162db131aca6f2d
+      size: 6713
+    outs:
+    - path: data/processed/test.csv
+      hash: md5
+      md5: 6d5f859ebbee77fba7712179e09b8b3b
+      size: 695863
+    - path: data/processed/train.csv
+      hash: md5
+      md5: d032e17cd5e1ad966b3ae4f32183e2ae
+      size: 2781212
+  train:
+    cmd: python src/models/train.py
+    deps:
+    - path: data/processed/test.csv
+      hash: md5
+      md5: 6d5f859ebbee77fba7712179e09b8b3b
+      size: 695863
+    - path: data/processed/train.csv
+      hash: md5
+      md5: d032e17cd5e1ad966b3ae4f32183e2ae
+      size: 2781212
+    - path: src/models/train.py
+      hash: md5
+      md5: 1aa6a49d33c9f110b94981436ff21bd7
+      size: 8251
+    outs:
+    - path: models/credit_model.pkl
+      hash: md5
+      md5: f565d22e863d7ed6c4f56c13eaf49886
+      size: 726515
+    - path: reports/metrics.json
+      hash: md5
+      md5: 43f28be0101d4fd9f079266552aa6773
+      size: 216
+  explain:
+    cmd: python src/models/explainability.py
+    deps:
+    - path: data/processed/test.csv
+      hash: md5
+      md5: 6d5f859ebbee77fba7712179e09b8b3b
+      size: 695863
+    - path: models/credit_model.pkl
+      hash: md5
+      md5: f565d22e863d7ed6c4f56c13eaf49886
+      size: 726515
+    - path: src/models/explainability.py
+      hash: md5
+      md5: 37848bd6d33ada2823bc623dc7172987
+      size: 6104
+    outs:
+    - path: reports/shap_feature_importance.png
+      hash: md5
+      md5: 97fbe803cef347026f287d4613170b17
+      size: 73742
+    - path: reports/shap_summary.png
+      hash: md5
+      md5: 40ad9369a52fd0be4513686b9a930781
+      size: 206626

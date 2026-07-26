@@ -9,6 +9,7 @@ form inputs, not pre-generated.
 
 import os
 import json
+import re
 from pathlib import Path
 
 try:
@@ -258,6 +259,64 @@ def run_reporting_agent(llm_client, decision, proba, contributions, compliance_a
     return completion.choices[0].message.content
 
 
+REQUIRED_APPLICANT_FIELDS = (
+    ["LIMIT_BAL", "SEX", "EDUCATION", "MARRIAGE", "AGE"]
+    + ["PAY_0", "PAY_2", "PAY_3", "PAY_4", "PAY_5", "PAY_6"]
+    + [f"BILL_AMT{i}" for i in range(1, 7)]
+    + [f"PAY_AMT{i}" for i in range(1, 7)]
+)
+
+
+def parse_applicant_from_text(description: str, llm_client):
+    """Gen AI feature: turns a free-text applicant description into the 23
+    structured fields the form needs, using the LLM to do the extraction.
+    This is a different use of the LLM than the RAG/synthesis agents above -
+    structured extraction rather than retrieval or summarization. Returns a
+    dict on success, or (None, error_message) on failure so the caller can
+    show a clear reason instead of silently doing nothing."""
+    if llm_client is None:
+        return None, "LLM is not configured (missing GROQ_API_KEY)."
+    if not description.strip():
+        return None, "Please enter a description first."
+
+    system_prompt = (
+        "You are a data-entry assistant. Extract these 23 fields from the "
+        "applicant description as a JSON object with EXACTLY these keys: "
+        "LIMIT_BAL, SEX, EDUCATION, MARRIAGE, AGE, PAY_0, PAY_2, PAY_3, PAY_4, "
+        "PAY_5, PAY_6, BILL_AMT1, BILL_AMT2, BILL_AMT3, BILL_AMT4, BILL_AMT5, "
+        "BILL_AMT6, PAY_AMT1, PAY_AMT2, PAY_AMT3, PAY_AMT4, PAY_AMT5, PAY_AMT6.\n"
+        "SEX: 1=male, 2=female. EDUCATION: 1=graduate school, 2=university, "
+        "3=high school, 4=other. MARRIAGE: 1=married, 2=single, 3=other. "
+        "PAY_0/PAY_2-6: -1=paid on time, 1 or higher=that many months late.\n"
+        "If a field is not mentioned, use a reasonable default (0 for amounts, "
+        "-1 for payment status, 35 for age, 1 for sex, 2 for education, 2 for marriage).\n"
+        "Output ONLY the JSON object - no markdown fences, no extra text."
+    )
+
+    try:
+        completion = llm_client.chat.completions.create(
+            model="meta-llama/Llama-3.3-70B-Instruct",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": description},
+            ],
+            temperature=0.0,
+        )
+        raw = completion.choices[0].message.content.strip()
+        raw = re.sub(r"^```(json)?|```$", "", raw, flags=re.MULTILINE).strip()
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, "The AI's response wasn't valid JSON - please try rephrasing."
+    except Exception as e:
+        return None, f"AI extraction failed: {e}"
+
+    missing = [k for k in REQUIRED_APPLICANT_FIELDS if k not in parsed]
+    if missing:
+        return None, f"The AI's response was missing fields: {', '.join(missing)}"
+
+    return parsed, None
+
+
 # ── Live chart builders ────────────────────────────────────
 
 def render_shap_chart(contributions):
@@ -356,17 +415,24 @@ def render_category_chart(category_totals):
 
 # ── UI ─────────────────────────────────────────────────────
 
-st.markdown(
-    """
-    <div class="hero-card">
-        <h1 style="margin-bottom:0.2rem;">Sentinel - Credit Underwriting</h1>
-        <p style="margin:0; font-size:1.02rem;">Live risk scoring, per-applicant SHAP
-        explanations, and SBP compliance checking.</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-st.markdown("")
+st.title("Sentinel - Credit Underwriting")
+st.caption("Live risk scoring, per-applicant SHAP explanations, and SBP compliance checking.")
+
+with st.expander("How this pipeline works (4 agents)", expanded=True):
+    p1, p2, p3, p4 = st.columns(4)
+    with p1:
+        st.markdown("**1. Data Agent**")
+        st.caption("Validates the applicant's numbers, checks them against SBP's exposure caps, and computes the engineered features.")
+    with p2:
+        st.markdown("**2. Risk Agent**")
+        st.caption("The trained XGBoost model scores default probability and explains the score with SHAP.")
+    with p3:
+        st.markdown("**3. Compliance Agent**")
+        st.caption("Retrieves the most relevant SBP regulation and explains it in plain language via an LLM.")
+    with p4:
+        st.markdown("**4. Reporting Agent**")
+        st.caption("Combines the three outputs above into one short, readable memo.")
+    st.caption("Data Agent → Risk Agent → Compliance Agent → Reporting Agent — each step's output feeds the next.")
 
 model, threshold = load_risk_model()
 index, chunks, embed_model = load_compliance_resources()
