@@ -449,19 +449,39 @@ with live_tab:
         "computed live from these exact numbers."
     )
 
+    st.markdown("**🤖 AI quick-fill (optional)**")
+    st.caption("Describe the applicant in plain English and let AI fill in the fields below.")
+    quickfill_text = st.text_area(
+        "Applicant description",
+        placeholder=(
+            "e.g. 35-year-old married university graduate, credit limit 50000, "
+            "always pays on time, spends around 15000 a month on the card."
+        ),
+        label_visibility="collapsed",
+        key="quickfill_text",
+    )
+    if st.button("Parse with AI"):
+        parsed, error = parse_applicant_from_text(quickfill_text, llm_client)
+        if error:
+            st.warning(error)
+        else:
+            for field_key, value in parsed.items():
+                st.session_state[field_key] = value
+            st.success("Fields filled in below — review and adjust before clicking Analyze.")
+
     with st.form("applicant_form"):
         c1, c2, c3 = st.columns(3)
         with c1:
-            limit_bal = st.number_input("Credit limit (LIMIT_BAL)", min_value=0, value=50000, step=1000)
-            age = st.number_input("Age", min_value=18, max_value=100, value=35)
+            limit_bal = st.number_input("Credit limit (LIMIT_BAL)", min_value=0, value=50000, step=1000, key="LIMIT_BAL")
+            age = st.number_input("Age", min_value=18, max_value=100, value=35, key="AGE")
         with c2:
-            sex = st.selectbox("Sex", options=[1, 2], format_func=lambda x: SEX_LABELS[x])
+            sex = st.selectbox("Sex", options=[1, 2], format_func=lambda x: SEX_LABELS[x], key="SEX")
             education = st.selectbox(
-                "Education", options=[1, 2, 3, 4], format_func=lambda x: EDUCATION_LABELS[x]
+                "Education", options=[1, 2, 3, 4], format_func=lambda x: EDUCATION_LABELS[x], key="EDUCATION"
             )
         with c3:
             marriage = st.selectbox(
-                "Marital status", options=[1, 2, 3], format_func=lambda x: MARRIAGE_LABELS[x]
+                "Marital status", options=[1, 2, 3], format_func=lambda x: MARRIAGE_LABELS[x], key="MARRIAGE"
             )
 
         st.markdown("**Repayment status, last 6 months** (-1 = paid on time, 1+ = months late)")
@@ -477,14 +497,14 @@ with live_tab:
         bill_values = []
         for i, col in enumerate(bill_cols_ui, start=1):
             with col:
-                bill_values.append(st.number_input(f"BILL_AMT{i}", min_value=0, value=10000, key=f"bill_{i}"))
+                bill_values.append(st.number_input(f"BILL_AMT{i}", min_value=0, value=10000, key=f"BILL_AMT{i}"))
 
         st.markdown("**Amount paid, last 6 months**")
         payamt_cols_ui = st.columns(6)
         payamt_values = []
         for i, col in enumerate(payamt_cols_ui, start=1):
             with col:
-                payamt_values.append(st.number_input(f"PAY_AMT{i}", min_value=0, value=2000, key=f"payamt_{i}"))
+                payamt_values.append(st.number_input(f"PAY_AMT{i}", min_value=0, value=2000, key=f"PAY_AMT{i}"))
 
         submitted = st.form_submit_button("Analyze", use_container_width=True)
 
