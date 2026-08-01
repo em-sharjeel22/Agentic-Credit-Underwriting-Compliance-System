@@ -1,0 +1,49 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest dvc[azure] mlflow
+
+      - name: Run tests
+        run: pytest src/
+
+  dvc-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install DVC
+        run: pip install dvc[azure]
+      - name: Reproduce pipeline
+        run: dvc repro
+
+  deploy-streamlit:
+    runs-on: ubuntu-latest
+    needs: [build-test, dvc-pipeline]
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run Streamlit app
+        run: streamlit run streamlit_app.py --server.port 8501
