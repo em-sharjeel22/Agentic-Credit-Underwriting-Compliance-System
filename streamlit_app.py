@@ -1,9 +1,10 @@
 """
-Sentinel - Agentic Credit Underwriting & Compliance System
-Live Streamlit dashboard: enter an applicant's profile and get a
-real-time risk score, a SHAP explanation for that specific applicant,
-and an SBP regulatory compliance check - all computed live from the
-form inputs, not pre-generated.
+Sentinel - Agentic Credit Underwriting & Compliance System (corrected)
+This version includes robust handling for:
+ - missing model file (models/credit_model.pkl)
+ - unpickling errors when a custom XGBWrapper class is required
+ - optional auto-creation of a small dummy model for local development
+ - graceful handling when torchvision or sentence-transformers are unavailable
 """
 
 import os
@@ -19,21 +20,22 @@ except Exception:
     pass
 
 import joblib
+import numpy as np
 import pandas as pd
 import xgboost as xgb
 import faiss
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# Some transformers/image modules import torchvision at import-time in some environments.
-# We attempt to import torchvision to reduce noisy import errors; if unavailable we continue.
+# Try to import torchvision to reduce noisy import errors from transformers.
+# If unavailable, we continue but log a warning.
 try:
     import torchvision  # noqa: F401
     TORCHVISION_AVAILABLE = True
 except Exception:
     TORCHVISION_AVAILABLE = False
 
-# SentenceTransformer may be heavy or unavailable in some environments; import lazily and handle failures.
+# SentenceTransformer may be heavy or unavailable in some environments; import lazily.
 try:
     from sentence_transformers import SentenceTransformer
     SENTENCE_TRANSFORMERS_AVAILABLE = True
@@ -51,20 +53,14 @@ METADATA_PATH = KB_DIR / "chunk_metadata.json"
 REPORTS_DIR = BASE_DIR / "reports"
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 
-# SBP Regulation R-8 thresholds, hardcoded from the source document so
-# the numeric compliance check is deterministic rather than LLM-guessed.
+# SBP Regulation R-8 thresholds
 SBP_R8_PERSONAL_CLEAN_CAP = 2_000_000
 SBP_R8_AGGREGATE_CAP = 5_000_000
 
-# Shared category labels - used both in the form's dropdowns and in the
-# human-readable applicant summary shown with the results.
 SEX_LABELS = {1: "Male", 2: "Female"}
 EDUCATION_LABELS = {1: "Graduate school", 2: "University", 3: "High school", 4: "Other"}
 MARRIAGE_LABELS = {1: "Married", 2: "Single", 3: "Other"}
 
-# Groups the 29 model features into three broad underwriting categories,
-# so results can be read at a "what kind of factor" level, not just a
-# feature-by-feature level.
 FEATURE_CATEGORIES = {
     "Demographics": {"SEX", "EDUCATION", "MARRIAGE", "AGE"},
     "Repayment Behavior": {
@@ -82,8 +78,47 @@ FEATURE_CATEGORIES = {
 st.set_page_config(page_title="Sentinel - Credit Underwriting", page_icon="🏦", layout="wide")
 
 
+# ---------------------------------------------------------------------
+# Provide a local XGBWrapper class so that unpickling bundles that reference
+# a custom XGBWrapper (from other environments) will succeed.
+# When a pickle references "main.XGBWrapper" or similar, Python looks up
+# that name in the importing module. Defining this class here avoids
+# "Can't get attribute 'XGBWrapper' on <module 'main'...>" errors.
+# ---------------------------------------------------------------------
+class XGBWrapper:
+    """
+    Minimal wrapper that exposes predict_proba and get_booster, and a feature_names property.
+    This mirrors the wrapper used when creating dummy bundles; if your real model
+    is a different object, prefer saving a plain xgboost Booster or a sklearn-compatible model.
+    """
+    def __init__(self, booster, feature_count: int = 29, feature_names: list | None = None):
+        self._booster = booster
+        if feature_names:
+            self._feature_names = feature_names
+        else:
+            self._feature_names = [f"f{i}" for i in range(feature_count)]
+
+    def predict_proba(self, X_df):
+        # Accept DataFrame-like or numpy array
+        if hasattr(X_df, "values"):
+            arr = X_df.values
+        else:
+            arr = np.asarray(X_df)
+        d = xgb.DMatrix(arr)
+        p = self._booster.predict(d)
+        return np.vstack([1 - p, p]).T
+
+    def get_booster(self):
+        return self._booster
+
+    @property
+    def feature_names(self):
+        return self._feature_names
+
+
+# ── Resource loaders ──────────────────────────────────────────
+
 def get_groq_key():
-    """Streamlit Cloud uses st.secrets; local dev falls back to an environment variable."""
     try:
         if "GROQ_API_KEY" in st.secrets:
             return st.secrets["GROQ_API_KEY"]
@@ -97,46 +132,24 @@ def load_risk_model(auto_create_dummy: bool = False):
     """
     Loads the model bundle from models/credit_model.pkl.
 
-    If the file is missing, the function shows a clear Streamlit error and stops.
-    Set auto_create_dummy=True to automatically create a small dummy model bundle
-    for local development (not recommended for production).
+    Behavior:
+    - If file missing: show a clear Streamlit error and stop, unless auto_create_dummy=True.
+    - If unpickling fails due to missing custom class, the local XGBWrapper above
+      will allow many common pickles to load successfully.
+    - If auto_create_dummy=True, a small synthetic xgboost model is created and saved.
     """
     if not MODEL_PATH.exists():
         st.error(
             f"❌ **Model file not found** at `{MODEL_PATH}`.\n\n"
-            "Please ensure `credit_model.pkl` is committed and pushed to your GitHub repository "
-            "inside the `models/` folder, or generate it during startup."
+            "Place `credit_model.pkl` in the `models/` folder, or enable auto_create_dummy=True for local testing."
         )
-
         if auto_create_dummy:
-            # Create a tiny dummy XGBoost model compatible with the app's expectations.
             try:
-                import numpy as np
                 from sklearn.datasets import make_classification
-
                 X, y = make_classification(n_samples=300, n_features=29, n_informative=10, random_state=42)
                 dtrain = xgb.DMatrix(X, label=y)
                 params = {"objective": "binary:logistic", "verbosity": 0}
                 bst = xgb.train(params, dtrain, num_boost_round=20)
-
-                class XGBWrapper:
-                    def __init__(self, booster, feature_count):
-                        self._booster = booster
-                        self._feature_names = [f"f{i}" for i in range(feature_count)]
-
-                    def predict_proba(self, X_df):
-                        arr = X_df.values if hasattr(X_df, "values") else np.asarray(X_df)
-                        d = xgb.DMatrix(arr)
-                        p = self._booster.predict(d)
-                        return np.vstack([1 - p, p]).T
-
-                    def get_booster(self):
-                        return self._booster
-
-                    @property
-                    def feature_names(self):
-                        return self._feature_names
-
                 model = XGBWrapper(bst, feature_count=29)
                 bundle = {"model": model, "threshold": 0.5}
                 MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -148,10 +161,24 @@ def load_risk_model(auto_create_dummy: bool = False):
         else:
             st.stop()
 
+    # Attempt to load the bundle. If the pickle references XGBWrapper, the class above
+    # will be available in this module and unpickling should succeed.
     try:
         bundle = joblib.load(MODEL_PATH)
     except Exception as e:
-        st.error(f"Failed to load model file `{MODEL_PATH}`: {e}")
+        # Provide a helpful error message and guidance
+        st.error(
+            "Failed to load model file "
+            f"`{MODEL_PATH}`: {e}\n\n"
+            "Common causes:\n"
+            "- The file is missing or path is incorrect.\n"
+            "- The pickle references a custom class that isn't defined in this module.\n\n"
+            "Fixes:\n"
+            "- Ensure `models/credit_model.pkl` exists and is a joblib dump of a dict with keys 'model' and 'threshold'.\n"
+            "- If you created the bundle with a custom wrapper, either recreate the bundle using a plain xgboost Booster or\n"
+            "  add the same wrapper class to this file (XGBWrapper is provided as a compatibility helper).\n"
+            "You can enable auto_create_dummy=True in load_risk_model() for a local dummy model."
+        )
         st.stop()
 
     if not isinstance(bundle, dict) or "model" not in bundle or "threshold" not in bundle:
@@ -163,12 +190,6 @@ def load_risk_model(auto_create_dummy: bool = False):
 
 @st.cache_resource(show_spinner="Loading compliance knowledge base...")
 def load_compliance_resources():
-    """
-    Loads FAISS index, chunk metadata, and embedding model.
-
-    If the FAISS index or metadata are missing, returns (None, [], None) and warns.
-    If SentenceTransformer is not available, returns (None, [], None) and warns.
-    """
     if not INDEX_PATH.exists() or not METADATA_PATH.exists():
         st.warning(
             f"⚠️ **Compliance knowledge base files not found** in `{KB_DIR}`.\n"
@@ -178,8 +199,8 @@ def load_compliance_resources():
 
     if not SENTENCE_TRANSFORMERS_AVAILABLE:
         st.warning(
-            "⚠️ SentenceTransformers is not available in this environment. "
-            "Semantic search will be disabled. Install `sentence-transformers` to enable compliance retrieval."
+            "⚠️ `sentence-transformers` is not installed. Semantic search will be disabled. "
+            "Install `sentence-transformers` to enable compliance retrieval."
         )
         return None, [], None
 
@@ -217,10 +238,9 @@ def load_llm_client():
         return None
 
 
-# ── Agent logic ────────────────────────────────────────────
+# ── Agent logic (unchanged, kept robust) ─────────────────────
 
 def engineer_features(raw: dict) -> dict:
-    """Turns the 23 raw fields into the same engineered features used at training time."""
     bill_cols = [raw[f"BILL_AMT{i}"] for i in range(1, 7)]
     pay_amt_cols = [raw[f"PAY_AMT{i}"] for i in range(1, 7)]
     pay_status_cols = [raw["PAY_0"]] + [raw[f"PAY_{i}"] for i in range(2, 7)]
@@ -247,7 +267,6 @@ def engineer_features(raw: dict) -> dict:
 
 
 def run_data_agent(raw: dict) -> dict:
-    """Validates the applicant's numbers and flags any SBP R-8 exposure-cap breaches."""
     warnings = []
     if raw.get("LIMIT_BAL", 0) <= 0:
         warnings.append("LIMIT_BAL is zero or negative.")
@@ -267,13 +286,10 @@ def run_data_agent(raw: dict) -> dict:
 
 
 def run_risk_agent(model, threshold, applicant: dict):
-    """Scores the applicant and returns SHAP contributions computed natively by XGBoost."""
-    # Attempt to obtain feature names from the model if available; otherwise use applicant keys.
     feature_names = None
     try:
         feature_names = model.get_booster().feature_names
     except Exception:
-        # Some wrappers expose feature_names differently
         try:
             feature_names = getattr(model, "feature_names", None)
         except Exception:
@@ -300,36 +316,28 @@ def run_risk_agent(model, threshold, applicant: dict):
 
 
 def normalize_regulation_id(regulation_type: str, regulation_number: str) -> str:
-    """Build a canonical regulation ID, e.g. R + 3 -> REGULATION R-3."""
     return f"REGULATION {regulation_type.upper()}-{int(regulation_number)}"
 
 
 def find_exact_regulation(query: str, chunks: list):
-    """Find an explicitly requested SBP regulation before semantic search."""
     match = re.search(
         r"(?<![A-Z0-9])(?:REGULATION\s+)?([RO])\s*-?\s*(\d+)(?![A-Z0-9])",
         query.upper(),
     )
-
     if not match:
         return None
-
     requested_id = normalize_regulation_id(match.group(1), match.group(2))
-
     for chunk in chunks:
         if chunk.get("id", "").lower() == requested_id.lower().replace("regulation ", "regulation_").replace("-", "_"):
             return chunk
-
     for chunk in chunks:
         section = chunk.get("section", "").upper().strip()
         if section == requested_id or section.startswith(requested_id + ":"):
             return chunk
-
     return None
 
 
 def retrieve_and_answer(query, index, chunks, embed_model, llm_client, top_k=3):
-    """Retrieve the relevant SBP regulation and explain it."""
     if index is None or not chunks or embed_model is None:
         return "Compliance knowledge base is not available.", []
 
@@ -338,59 +346,29 @@ def retrieve_and_answer(query, index, chunks, embed_model, llm_client, top_k=3):
     if exact_chunk is not None:
         retrieved = [exact_chunk]
     else:
-        query_vector = embed_model.encode(
-            [query],
-            convert_to_numpy=True
-        ).astype("float32")
-
+        query_vector = embed_model.encode([query], convert_to_numpy=True).astype("float32")
         _, indices = index.search(query_vector, top_k)
-
-        retrieved = [
-            chunks[int(i)]
-            for i in indices[0]
-            if 0 <= int(i) < len(chunks)
-        ]
+        retrieved = [chunks[int(i)] for i in indices[0] if 0 <= int(i) < len(chunks)]
 
     if not retrieved:
-        return (
-            "I could not find a matching SBP regulation in the knowledge base.",
-            [],
-        )
+        return ("I could not find a matching SBP regulation in the knowledge base.", [])
 
-    context = "\n\n".join(
-        f"[{c.get('section', 'Unknown section')}]\n{c.get('text', '')}"
-        for c in retrieved
-    )
-
-    sources = list(dict.fromkeys(
-        c.get("section", "Unknown section") for c in retrieved
-    ))
+    context = "\n\n".join(f"[{c.get('section', 'Unknown section')}]\n{c.get('text', '')}" for c in retrieved)
+    sources = list(dict.fromkeys(c.get("section", "Unknown section") for c in retrieved))
 
     if llm_client is None:
-        return (
-            "LLM is not configured (missing GROQ_API_KEY). Showing the raw retrieved "
-            "regulation text instead:\n\n" + context,
-            sources,
-        )
+        return ("LLM is not configured (missing GROQ_API_KEY). Showing the raw retrieved regulation text instead:\n\n" + context, sources)
 
     try:
         completion = llm_client.chat.completions.create(
             model="meta-llama/Llama-3.3-70B-Instruct",
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an SBP compliance officer. Answer ONLY using the "
-                        "provided regulation text. If the user explicitly requested a "
-                        "regulation number, explain that regulation clearly in simple "
-                        "language. Always cite only regulation numbers present in the "
-                        "provided context."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Regulations:\n{context}\n\nQuestion: {query}",
-                },
+                {"role": "system", "content": (
+                    "You are an SBP compliance officer. Answer ONLY using the provided regulation text. "
+                    "If the user explicitly requested a regulation number, explain that regulation clearly in simple language. "
+                    "Always cite only regulation numbers present in the provided context."
+                )},
+                {"role": "user", "content": f"Regulations:\n{context}\n\nQuestion: {query}"},
             ],
             temperature=0.1,
         )
@@ -400,49 +378,29 @@ def retrieve_and_answer(query, index, chunks, embed_model, llm_client, top_k=3):
 
 
 def run_compliance_agent(index, chunks, embed_model, llm_client, applicant, decision, sbp_flags):
-    """Builds an applicant-specific compliance question and retrieves the answer."""
     if sbp_flags.get("exceeds_r8_aggregate_cap"):
-        query = (
-            "What SBP regulation applies when a customer's aggregate clean "
-            "credit card and personal loan exposure exceeds Rs 5,000,000?"
-        )
+        query = "What SBP regulation applies when a customer's aggregate clean credit card and personal loan exposure exceeds Rs 5,000,000?"
     elif sbp_flags.get("exceeds_r8_personal_clean_cap"):
-        query = (
-            "What SBP regulation applies when a customer's clean credit "
-            "card limit exceeds Rs 2,000,000?"
-        )
+        query = "What SBP regulation applies when a customer's clean credit card limit exceeds Rs 2,000,000?"
     else:
-        query = (
-            f"What SBP regulations apply when a bank {decision.lower()}s a consumer "
-            f"financing application with credit limit {applicant.get('LIMIT_BAL', 'N/A')}?"
-        )
+        query = f"What SBP regulations apply when a bank {decision.lower()}s a consumer financing application with credit limit {applicant.get('LIMIT_BAL', 'N/A')}?"
     return retrieve_and_answer(query, index, chunks, embed_model, llm_client)
 
 
 def run_reporting_agent(llm_client, decision, proba, contributions, compliance_answer):
-    """Synthesizes the Risk Agent and Compliance Agent outputs into a decision memo."""
     if llm_client is None:
         return None
-
-    factors_text = ", ".join(
-        f"{f[0]} ({'raises' if f[1] > 0 else 'lowers'} risk)" for f in contributions[:5]
-    )
-
+    factors_text = ", ".join(f"{f[0]} ({'raises' if f[1] > 0 else 'lowers'} risk)" for f in contributions[:5])
     try:
         completion = llm_client.chat.completions.create(
             model="meta-llama/Llama-3.3-70B-Instruct",
             messages=[
                 {"role": "system", "content": (
-                    "You are a senior credit underwriting officer writing a short "
-                    "decision memo for a bank manager. Combine the risk assessment "
-                    "and compliance findings into 3-4 clear sentences. Use only the "
-                    "facts given below - never invent numbers or regulations."
+                    "You are a senior credit underwriting officer writing a short decision memo for a bank manager. "
+                    "Combine the risk assessment and compliance findings into 3-4 clear sentences. Use only the facts given below - never invent numbers or regulations."
                 )},
                 {"role": "user", "content": (
-                    f"Decision: {decision}\n"
-                    f"Default probability: {proba * 100:.1f}%\n"
-                    f"Key factors: {factors_text}\n"
-                    f"Compliance findings: {compliance_answer}"
+                    f"Decision: {decision}\nDefault probability: {proba * 100:.1f}%\nKey factors: {factors_text}\nCompliance findings: {compliance_answer}"
                 )},
             ],
             temperature=0.2,
@@ -461,33 +419,26 @@ REQUIRED_APPLICANT_FIELDS = (
 
 
 def parse_applicant_from_text(description: str, llm_client):
-    """Turns a free-text applicant description into structured fields using LLM extraction."""
     if llm_client is None:
         return None, "LLM is not configured (missing GROQ_API_KEY)."
     if not description.strip():
         return None, "Please enter a description first."
 
     system_prompt = (
-        "You are a data-entry assistant. Extract these 23 fields from the "
-        "applicant description as a JSON object with EXACTLY these keys: "
-        "LIMIT_BAL, SEX, EDUCATION, MARRIAGE, AGE, PAY_0, PAY_2, PAY_3, PAY_4, "
-        "PAY_5, PAY_6, BILL_AMT1, BILL_AMT2, BILL_AMT3, BILL_AMT4, BILL_AMT5, "
-        "BILL_AMT6, PAY_AMT1, PAY_AMT2, PAY_AMT3, PAY_AMT4, PAY_AMT5, PAY_AMT6.\n"
-        "SEX: 1=male, 2=female. EDUCATION: 1=graduate school, 2=university, "
-        "3=high school, 4=other. MARRIAGE: 1=married, 2=single, 3=other. "
-        "PAY_0/PAY_2-6: -1=paid on time, 1 or higher=that many months late.\n"
-        "If a field is not mentioned, use a reasonable default (0 for amounts, "
-        "-1 for payment status, 35 for age, 1 for sex, 2 for education, 2 for marriage).\n"
+        "You are a data-entry assistant. Extract these 23 fields from the applicant description as a JSON object with EXACTLY these keys: "
+        "LIMIT_BAL, SEX, EDUCATION, MARRIAGE, AGE, PAY_0, PAY_2, PAY_3, PAY_4, PAY_5, PAY_6, "
+        "BILL_AMT1, BILL_AMT2, BILL_AMT3, BILL_AMT4, BILL_AMT5, BILL_AMT6, "
+        "PAY_AMT1, PAY_AMT2, PAY_AMT3, PAY_AMT4, PAY_AMT5, PAY_AMT6.\n"
+        "SEX: 1=male, 2=female. EDUCATION: 1=graduate school, 2=university, 3=high school, 4=other. "
+        "MARRIAGE: 1=married, 2=single, 3=other. PAY_0/PAY_2-6: -1=paid on time, 1 or higher=that many months late.\n"
+        "If a field is not mentioned, use a reasonable default (0 for amounts, -1 for payment status, 35 for age, 1 for sex, 2 for education, 2 for marriage).\n"
         "Output ONLY the JSON object - no markdown fences, no extra text."
     )
 
     try:
         completion = llm_client.chat.completions.create(
             model="meta-llama/Llama-3.3-70B-Instruct",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": description},
-            ],
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": description}],
             temperature=0.0,
         )
         raw = completion.choices[0].message.content.strip()
@@ -505,15 +456,13 @@ def parse_applicant_from_text(description: str, llm_client):
     return parsed, None
 
 
-# ── Live chart builders ────────────────────────────────────
+# ── Visualization helpers (unchanged) ───────────────────────
 
 def render_shap_chart(contributions):
-    """Bar chart of top SHAP factors."""
     top = contributions[:8]
     labels = [f[0] for f in top][::-1]
     values = [f[1] for f in top][::-1]
     colors = ["#d64545" if v > 0 else "#2f9e58" for v in values]
-
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.barh(labels, values, color=colors)
     ax.axvline(0, color="#333333", linewidth=0.8)
@@ -524,7 +473,6 @@ def render_shap_chart(contributions):
 
 
 def verify_summary_citations(polished_summary: str, compliance_sources: list) -> bool:
-    """Lightweight hallucination guard for compliance citations."""
     cited = {c.upper() for c in re.findall(r"REGULATION\s+[RO]-\d+", polished_summary, re.IGNORECASE)}
     sources = {s.upper() for s in compliance_sources}
     return cited.issubset(sources)
@@ -539,10 +487,7 @@ def payment_history_dataframe(applicant):
 
 def repayment_status_dataframe(applicant):
     months = ["M-6", "M-5", "M-4", "M-3", "M-2", "M-1 (latest)"]
-    status = [
-        applicant["PAY_6"], applicant["PAY_5"], applicant["PAY_4"],
-        applicant["PAY_3"], applicant["PAY_2"], applicant["PAY_0"],
-    ]
+    status = [applicant["PAY_6"], applicant["PAY_5"], applicant["PAY_4"], applicant["PAY_3"], applicant["PAY_2"], applicant["PAY_0"]]
     return pd.DataFrame({"Repayment status (-1=on time, 1+=months late)": status}, index=months)
 
 
@@ -575,7 +520,6 @@ def render_category_chart(category_totals):
     labels = list(category_totals.keys())
     values = list(category_totals.values())
     colors = ["#d64545" if v > 0 else "#2f9e58" for v in values]
-
     fig, ax = plt.subplots(figsize=(6, 2.6))
     ax.barh(labels, values, color=colors)
     ax.axvline(0, color="#333333", linewidth=0.8)
@@ -610,25 +554,17 @@ model, threshold = load_risk_model(auto_create_dummy=False)
 index, chunks, embed_model = load_compliance_resources()
 llm_client = load_llm_client()
 
-live_tab, chat_tab, reports_tab = st.tabs(
-    ["Live Underwriting", "Ask about Regulations", "Model Training Reports"]
-)
+live_tab, chat_tab, reports_tab = st.tabs(["Live Underwriting", "Ask about Regulations", "Model Training Reports"])
 
 with live_tab:
     st.subheader("Applicant profile")
-    st.caption(
-        "Enter an applicant's details and click Analyze. Every chart below is "
-        "computed live from these exact numbers."
-    )
+    st.caption("Enter an applicant's details and click Analyze. Every chart below is computed live from these exact numbers.")
 
     st.markdown("**🤖 AI quick-fill (optional)**")
     st.caption("Describe the applicant in plain English and let AI fill in the fields below.")
     quickfill_text = st.text_area(
         "Applicant description",
-        placeholder=(
-            "e.g. 35-year-old married university graduate, credit limit 50000, "
-            "always pays on time, spends around 15000 a month on the card."
-        ),
+        placeholder=("e.g. 35-year-old married university graduate, credit limit 50000, always pays on time, spends around 15000 a month on the card."),
         label_visibility="collapsed",
         key="quickfill_text",
     )
@@ -648,13 +584,9 @@ with live_tab:
             age = st.number_input("Age", min_value=18, max_value=100, value=35, key="AGE")
         with c2:
             sex = st.selectbox("Sex", options=[1, 2], format_func=lambda x: SEX_LABELS[x], key="SEX")
-            education = st.selectbox(
-                "Education", options=[1, 2, 3, 4], format_func=lambda x: EDUCATION_LABELS[x], key="EDUCATION"
-            )
+            education = st.selectbox("Education", options=[1, 2, 3, 4], format_func=lambda x: EDUCATION_LABELS[x], key="EDUCATION")
         with c3:
-            marriage = st.selectbox(
-                "Marital status", options=[1, 2, 3], format_func=lambda x: MARRIAGE_LABELS[x], key="MARRIAGE"
-            )
+            marriage = st.selectbox("Marital status", options=[1, 2, 3], format_func=lambda x: MARRIAGE_LABELS[x], key="MARRIAGE")
 
         st.markdown("**Repayment status, last 6 months** (-1 = paid on time, 1+ = months late)")
         pay_cols = st.columns(6)
@@ -694,12 +626,8 @@ with live_tab:
         data_result = run_data_agent(raw_applicant)
         applicant = engineer_features(raw_applicant)
         proba, decision, contributions = run_risk_agent(model, threshold, applicant)
-        compliance_answer, compliance_sources = run_compliance_agent(
-            index, chunks, embed_model, llm_client, applicant, decision, data_result["sbp_flags"]
-        )
-        polished_summary = run_reporting_agent(
-            llm_client, decision, proba, contributions, compliance_answer
-        )
+        compliance_answer, compliance_sources = run_compliance_agent(index, chunks, embed_model, llm_client, applicant, decision, data_result["sbp_flags"])
+        polished_summary = run_reporting_agent(llm_client, decision, proba, contributions, compliance_answer)
 
         for w in data_result["warnings"]:
             st.warning(w)
@@ -710,26 +638,16 @@ with live_tab:
             st.markdown("---")
             st.markdown("**Underwriting memo**")
             if not verify_summary_citations(polished_summary, compliance_sources):
-                st.warning(
-                    "This summary may reference a regulation that was not actually "
-                    "retrieved — verify against the Compliance check section below."
-                )
+                st.warning("This summary may reference a regulation that was not actually retrieved — verify against the Compliance check section below.")
             st.info(polished_summary)
 
         st.markdown("---")
         st.markdown("**Engineered features** (computed live from the 6-month history)")
-        engineered_names = [
-            "utilization_ratio", "avg_pay_delay", "max_pay_delay",
-            "months_late", "payment_ratio", "delay_trend",
-        ]
-        engineered_df = pd.DataFrame({
-            "Feature": engineered_names,
-            "Value": [applicant[name] for name in engineered_names],
-        })
+        engineered_names = ["utilization_ratio", "avg_pay_delay", "max_pay_delay", "months_late", "payment_ratio", "delay_trend"]
+        engineered_df = pd.DataFrame({"Feature": engineered_names, "Value": [applicant[name] for name in engineered_names]})
         st.dataframe(engineered_df, hide_index=True, use_container_width=True)
 
         res1, res2 = st.columns([1, 2])
-
         with res1:
             st.metric("Default probability", f"{proba * 100:.1f}%")
             if decision == "APPROVE":
@@ -737,10 +655,8 @@ with live_tab:
             else:
                 st.error(f"Decision: {decision}")
             st.progress(min(proba, 1.0))
-
             st.markdown(f"**Credit utilization: {applicant['utilization_ratio'] * 100:.1f}%**")
             st.progress(min(applicant["utilization_ratio"], 1.0))
-
             st.markdown("**Payment amounts (live)**")
             st.line_chart(payment_history_dataframe(applicant))
 
@@ -748,7 +664,6 @@ with live_tab:
             st.markdown("**Why this score (live SHAP explanation)**")
             fig = render_shap_chart(contributions)
             st.pyplot(fig)
-
             st.markdown("**Repayment status trend (live)**")
             st.bar_chart(repayment_status_dataframe(applicant))
 
@@ -769,10 +684,7 @@ with live_tab:
 
 with chat_tab:
     st.subheader("Ask about SBP regulations")
-    st.caption(
-        "Ask any question about the SBP Prudential Regulations for Consumer "
-        "Financing directly - independent of the applicant form."
-    )
+    st.caption("Ask any question about the SBP Prudential Regulations for Consumer Financing directly - independent of the applicant form.")
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
@@ -788,23 +700,16 @@ with chat_tab:
         st.session_state.chat_history.append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.write(question)
-
         with st.chat_message("assistant"):
             with st.spinner("Searching regulations..."):
                 answer, sources = retrieve_and_answer(question, index, chunks, embed_model, llm_client)
             st.write(answer)
             st.caption(f"Sources: {', '.join(sources)}")
-
-        st.session_state.chat_history.append(
-            {"role": "assistant", "content": answer, "sources": sources}
-        )
+        st.session_state.chat_history.append({"role": "assistant", "content": answer, "sources": sources})
 
 with reports_tab:
     st.subheader("Model training reports")
-    st.caption(
-        "These figures describe the overall model, generated once during training - "
-        "they do not change with the applicant form above."
-    )
+    st.caption("These figures describe the overall model, generated once during training - they do not change with the applicant form above.")
 
     descriptions = {
         "confusion_matrix.png": "Confusion matrix on the held-out test set.",
