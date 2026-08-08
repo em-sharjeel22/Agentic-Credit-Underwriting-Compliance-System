@@ -48,6 +48,18 @@ def search(query, index, chunks, embed_model=None, top_k=3):
                 "text": chunks[idx]["text"],
                 "distance": float(distances[0][rank]),
             })
+
+    # Exact match fallback
+    for chunk in chunks:
+        if query.strip().lower() in chunk["section"].lower():
+            results.insert(0, {
+                "rank": 0,
+                "section": chunk["section"],
+                "text": chunk["text"],
+                "distance": 0.0,
+            })
+            break
+
     return results
 
 
@@ -56,3 +68,21 @@ def retrieve_context(question, index, chunks, embed_model=None, top_k=3):
     context = "\n\n".join([f"[{r['section']}]\n{r['text']}" for r in results])
     sources = list(dict.fromkeys([r['section'] for r in results]))
     return context, sources
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Query RAG index")
+    parser.add_argument("--query", type=str, required=True, help="Query string")
+    args = parser.parse_args()
+
+    # Load vectorstore
+    index, chunks, embed_model = load_vectorstore()
+
+    # Retrieve context
+    context, sources = retrieve_context(args.query, index, chunks, embed_model=embed_model)
+
+    print("\n=== Retrieved Context ===\n")
+    print(context)
+    print("\n=== Sources ===\n")
+    print(sources)
