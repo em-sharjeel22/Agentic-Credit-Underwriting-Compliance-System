@@ -62,7 +62,7 @@ def compliance_agent(state: UnderwritingState) -> Dict[str, Any]:
     
     try:
         # 0. Catch Global/Aggregation Queries first (Bypasses search for count/listing questions)
-        summary_match = re.search(r'(how many|list all|total number of|what are the)\s*regulations', query, re.IGNORECASE)
+        summary_match = re.search(r'(how many|list|total|what are).+regulation', query, re.IGNORECASE)
         
         if summary_match:
             logger.info("📊 [DEBUG] Global summary query detected. Bypassing search mechanisms.")
@@ -81,11 +81,12 @@ def compliance_agent(state: UnderwritingState) -> Dict[str, Any]:
         retrieved = []
         
         # 1. Aggressive regex to catch variations like "R-1", "R1", "R 1", or "O-5"
-        specific_reg_match = re.search(r'\b([R|O])\s*[-_]?\s*(\d+)\b', query, re.IGNORECASE)
+        # FIXED: Removed the pipe '|' from the character class
+        specific_reg_match = re.search(r'\b([RO])\s*[-_]?\s*(\d+)\b', query, re.IGNORECASE)
 
         if specific_reg_match:
-            reg_letter = specific_reg_match.group(1).upper() # Gets 'R'
-            reg_num = specific_reg_match.group(2)            # Gets '1'
+            reg_letter = specific_reg_match.group(1).upper() # Gets 'R' or 'O'
+            reg_num = specific_reg_match.group(2)            # Gets the number
             reg_id = f"{reg_letter}-{reg_num}"               # Standardizes to 'R-1'
             
             logger.info(f"🔍 [DEBUG] Agent caught exact request for: {reg_id}")
