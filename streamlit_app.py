@@ -157,7 +157,9 @@ def run_risk_agent(model, threshold, applicant: dict):
     """Scores the applicant and returns SHAP contributions computed natively by XGBoost
     (via pred_contribs), which avoids the shap library's fragile model-format parser."""
     feature_names = model.get_booster().feature_names
-    X = pd.DataFrame([applicant])[feature_names]
+    if not feature_names:
+        feature_names = list(pd.DataFrame([applicant]).columns)
+    X = pd.DataFrame([applicant]).reindex(columns=feature_names)
 
     proba = float(model.predict_proba(X)[0, 1])
     decision = "REJECT" if proba >= threshold else "APPROVE"
@@ -174,16 +176,84 @@ def run_risk_agent(model, threshold, applicant: dict):
     return proba, decision, contributions
 
 
+def normalize_regulation_id(regulation_type: str, regulation_number: str) -> str:
+    """Build a canonical regulation ID, e.g. R + 3 -> REGULATION R-3."""
+    return f"REGULATION {regulation_type.upper()}-{int(regulation_number)}"
+
+
+def find_exact_regulation(query: str, chunks: list):
+    """Find an explicitly requested SBP regulation before semantic search.
+
+    Supports queries such as:
+    - R-3
+    - R3
+    - Regulation R-3?
+    - Explain regulation R3
+    - What is O-2?
+    """
+    match = re.search(
+        r"(?<![A-Z0-9])(?:REGULATION\s+)?([RO])\s*-?\s*(\d+)(?![A-Z0-9])",
+        query.upper(),
+    )
+
+    if not match:
+        return None
+
+    requested_id = normalize_regulation_id(match.group(1), match.group(2))
+
+    # Prefer exact metadata ID if it exists.
+    for chunk in chunks:
+        if chunk.get("id", "").lower() == requested_id.lower().replace("regulation ", "regulation_").replace("-", "_"):
+            return chunk
+
+    # Otherwise match the section heading exactly.
+    for chunk in chunks:
+        section = chunk.get("section", "").upper().strip()
+        if section == requested_id or section.startswith(requested_id + ":"):
+            return chunk
+
+    return None
+
+
 def retrieve_and_answer(query, index, chunks, embed_model, llm_client, top_k=3):
-    """Shared retrieval + LLM-answer logic. Used by BOTH the compliance agent
-    (triggered automatically from an applicant's data) and the standalone
-    regulation chatbot (free-form questions typed by the user) - so both entry
-    points are backed by the exact same compliance engine."""
-    query_vector = embed_model.encode([query], convert_to_numpy=True).astype("float32")
-    distances, indices = index.search(query_vector, top_k)
-    retrieved = [chunks[i] for i in indices[0]]
-    context = "\n\n".join(f"[{c['section']}]\n{c['text']}" for c in retrieved)
-    sources = [c["section"] for c in retrieved]
+    """Retrieve the relevant SBP regulation and explain it.
+
+    Explicit regulation IDs use deterministic lookup first. Normal natural-
+    language questions continue to use semantic FAISS search.
+    """
+    exact_chunk = find_exact_regulation(query, chunks)
+
+    if exact_chunk is not None:
+        retrieved = [exact_chunk]
+    else:
+        query_vector = embed_model.encode(
+            [query],
+            convert_to_numpy=True
+        ).astype("float32")
+
+        _, indices = index.search(query_vector, top_k)
+
+        retrieved = [
+            chunks[int(i)]
+            for i in indices[0]
+            if 0 <= int(i) < len(chunks)
+        ]
+
+    if not retrieved:
+        return (
+            "I could not find a matching SBP regulation in the knowledge base.",
+            [],
+        )
+
+    context = "\n\n".join(
+        f"[{c.get('section', 'Unknown section')}]\n{c.get('text', '')}"
+        for c in retrieved
+    )
+
+    # Remove duplicate source names while preserving their retrieval order.
+    sources = list(dict.fromkeys(
+        c.get("section", "Unknown section") for c in retrieved
+    ))
 
     if llm_client is None:
         return (
@@ -195,14 +265,24 @@ def retrieve_and_answer(query, index, chunks, embed_model, llm_client, top_k=3):
     completion = llm_client.chat.completions.create(
         model="meta-llama/Llama-3.3-70B-Instruct",
         messages=[
-            {"role": "system", "content": (
-                "You are an SBP compliance officer. Answer ONLY using the regulation "
-                "text provided below. Always cite the regulation number."
-            )},
-            {"role": "user", "content": f"Regulations:\n{context}\n\nQuestion: {query}"},
+            {
+                "role": "system",
+                "content": (
+                    "You are an SBP compliance officer. Answer ONLY using the "
+                    "provided regulation text. If the user explicitly requested a "
+                    "regulation number, explain that regulation clearly in simple "
+                    "language. Always cite only regulation numbers present in the "
+                    "provided context."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Regulations:\n{context}\n\nQuestion: {query}",
+            },
         ],
         temperature=0.1,
     )
+
     return completion.choices[0].message.content, sources
 
 
