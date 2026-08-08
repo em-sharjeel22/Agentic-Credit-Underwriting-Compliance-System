@@ -1,6 +1,5 @@
 """
 Sentinel - Agentic Credit Underwriting & Compliance System
-
 Live Streamlit dashboard: enter an applicant's profile and get a
 real-time risk score, a SHAP explanation for that specific applicant,
 and an SBP regulatory compliance check - all computed live from the
@@ -11,11 +10,12 @@ import os
 import json
 import re
 from pathlib import Path
+import warnings
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except ImportError:
+except Exception:
     pass
 
 import joblib
@@ -24,7 +24,22 @@ import xgboost as xgb
 import faiss
 import matplotlib.pyplot as plt
 import streamlit as st
-from sentence_transformers import SentenceTransformer
+
+# Some transformers/image modules import torchvision at import-time in some environments.
+# We attempt to import torchvision to reduce noisy import errors; if unavailable we continue.
+try:
+    import torchvision  # noqa: F401
+    TORCHVISION_AVAILABLE = True
+except Exception:
+    TORCHVISION_AVAILABLE = False
+
+# SentenceTransformer may be heavy or unavailable in some environments; import lazily and handle failures.
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except Exception:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+
 from huggingface_hub import InferenceClient
 
 # ── Paths ──────────────────────────────────────────────────
@@ -78,30 +93,115 @@ def get_groq_key():
 
 
 @st.cache_resource(show_spinner="Loading risk model...")
-def load_risk_model():
+def load_risk_model(auto_create_dummy: bool = False):
+    """
+    Loads the model bundle from models/credit_model.pkl.
+
+    If the file is missing, the function shows a clear Streamlit error and stops.
+    Set auto_create_dummy=True to automatically create a small dummy model bundle
+    for local development (not recommended for production).
+    """
     if not MODEL_PATH.exists():
         st.error(
             f"❌ **Model file not found** at `{MODEL_PATH}`.\n\n"
             "Please ensure `credit_model.pkl` is committed and pushed to your GitHub repository "
-            "inside the `models/` folder, or generated during startup."
+            "inside the `models/` folder, or generate it during startup."
         )
+
+        if auto_create_dummy:
+            # Create a tiny dummy XGBoost model compatible with the app's expectations.
+            try:
+                import numpy as np
+                from sklearn.datasets import make_classification
+
+                X, y = make_classification(n_samples=300, n_features=29, n_informative=10, random_state=42)
+                dtrain = xgb.DMatrix(X, label=y)
+                params = {"objective": "binary:logistic", "verbosity": 0}
+                bst = xgb.train(params, dtrain, num_boost_round=20)
+
+                class XGBWrapper:
+                    def __init__(self, booster, feature_count):
+                        self._booster = booster
+                        self._feature_names = [f"f{i}" for i in range(feature_count)]
+
+                    def predict_proba(self, X_df):
+                        arr = X_df.values if hasattr(X_df, "values") else np.asarray(X_df)
+                        d = xgb.DMatrix(arr)
+                        p = self._booster.predict(d)
+                        return np.vstack([1 - p, p]).T
+
+                    def get_booster(self):
+                        return self._booster
+
+                    @property
+                    def feature_names(self):
+                        return self._feature_names
+
+                model = XGBWrapper(bst, feature_count=29)
+                bundle = {"model": model, "threshold": 0.5}
+                MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+                joblib.dump(bundle, MODEL_PATH)
+                st.warning("A dummy model was created at models/credit_model.pkl for development.")
+            except Exception as e:
+                st.error(f"Failed to auto-create dummy model: {e}")
+                st.stop()
+        else:
+            st.stop()
+
+    try:
+        bundle = joblib.load(MODEL_PATH)
+    except Exception as e:
+        st.error(f"Failed to load model file `{MODEL_PATH}`: {e}")
         st.stop()
-    bundle = joblib.load(MODEL_PATH)
+
+    if not isinstance(bundle, dict) or "model" not in bundle or "threshold" not in bundle:
+        st.error("Model bundle is invalid. Expected a dict with keys 'model' and 'threshold'.")
+        st.stop()
+
     return bundle["model"], bundle["threshold"]
 
 
 @st.cache_resource(show_spinner="Loading compliance knowledge base...")
 def load_compliance_resources():
+    """
+    Loads FAISS index, chunk metadata, and embedding model.
+
+    If the FAISS index or metadata are missing, returns (None, [], None) and warns.
+    If SentenceTransformer is not available, returns (None, [], None) and warns.
+    """
     if not INDEX_PATH.exists() or not METADATA_PATH.exists():
         st.warning(
             f"⚠️ **Compliance knowledge base files not found** in `{KB_DIR}`.\n"
             "Regulation search and automated compliance checks will be limited until the FAISS index and metadata are provided."
         )
         return None, [], None
-    index = faiss.read_index(str(INDEX_PATH))
-    with open(METADATA_PATH, "r", encoding="utf-8") as f:
-        chunks = json.load(f)
-    embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+
+    if not SENTENCE_TRANSFORMERS_AVAILABLE:
+        st.warning(
+            "⚠️ SentenceTransformers is not available in this environment. "
+            "Semantic search will be disabled. Install `sentence-transformers` to enable compliance retrieval."
+        )
+        return None, [], None
+
+    try:
+        index = faiss.read_index(str(INDEX_PATH))
+    except Exception as e:
+        st.error(f"Failed to read FAISS index at `{INDEX_PATH}`: {e}")
+        return None, [], None
+
+    try:
+        with open(METADATA_PATH, "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+    except Exception as e:
+        st.error(f"Failed to read metadata file `{METADATA_PATH}`: {e}")
+        return None, [], None
+
+    try:
+        embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    except Exception as e:
+        st.warning(f"Failed to load embedding model `{EMBED_MODEL_NAME}`: {e}")
+        return index, chunks, None
+
     return index, chunks, embed_model
 
 
@@ -110,7 +210,11 @@ def load_llm_client():
     key = get_groq_key()
     if not key:
         return None
-    return InferenceClient(provider="groq", api_key=key)
+    try:
+        return InferenceClient(provider="groq", api_key=key)
+    except Exception as e:
+        st.warning(f"Failed to initialize LLM client: {e}")
+        return None
 
 
 # ── Agent logic ────────────────────────────────────────────
@@ -164,9 +268,20 @@ def run_data_agent(raw: dict) -> dict:
 
 def run_risk_agent(model, threshold, applicant: dict):
     """Scores the applicant and returns SHAP contributions computed natively by XGBoost."""
-    feature_names = model.get_booster().feature_names
+    # Attempt to obtain feature names from the model if available; otherwise use applicant keys.
+    feature_names = None
+    try:
+        feature_names = model.get_booster().feature_names
+    except Exception:
+        # Some wrappers expose feature_names differently
+        try:
+            feature_names = getattr(model, "feature_names", None)
+        except Exception:
+            feature_names = None
+
     if not feature_names:
         feature_names = list(pd.DataFrame([applicant]).columns)
+
     X = pd.DataFrame([applicant]).reindex(columns=feature_names)
 
     proba = float(model.predict_proba(X)[0, 1])
@@ -258,28 +373,30 @@ def retrieve_and_answer(query, index, chunks, embed_model, llm_client, top_k=3):
             sources,
         )
 
-    completion = llm_client.chat.completions.create(
-        model="meta-llama/Llama-3.3-70B-Instruct",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are an SBP compliance officer. Answer ONLY using the "
-                    "provided regulation text. If the user explicitly requested a "
-                    "regulation number, explain that regulation clearly in simple "
-                    "language. Always cite only regulation numbers present in the "
-                    "provided context."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Regulations:\n{context}\n\nQuestion: {query}",
-            },
-        ],
-        temperature=0.1,
-    )
-
-    return completion.choices[0].message.content, sources
+    try:
+        completion = llm_client.chat.completions.create(
+            model="meta-llama/Llama-3.3-70B-Instruct",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an SBP compliance officer. Answer ONLY using the "
+                        "provided regulation text. If the user explicitly requested a "
+                        "regulation number, explain that regulation clearly in simple "
+                        "language. Always cite only regulation numbers present in the "
+                        "provided context."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Regulations:\n{context}\n\nQuestion: {query}",
+                },
+            ],
+            temperature=0.1,
+        )
+        return completion.choices[0].message.content, sources
+    except Exception as e:
+        return f"LLM completion failed: {e}\n\nRaw retrieved text:\n\n{context}", sources
 
 
 def run_compliance_agent(index, chunks, embed_model, llm_client, applicant, decision, sbp_flags):
@@ -311,25 +428,28 @@ def run_reporting_agent(llm_client, decision, proba, contributions, compliance_a
         f"{f[0]} ({'raises' if f[1] > 0 else 'lowers'} risk)" for f in contributions[:5]
     )
 
-    completion = llm_client.chat.completions.create(
-        model="meta-llama/Llama-3.3-70B-Instruct",
-        messages=[
-            {"role": "system", "content": (
-                "You are a senior credit underwriting officer writing a short "
-                "decision memo for a bank manager. Combine the risk assessment "
-                "and compliance findings into 3-4 clear sentences. Use only the "
-                "facts given below - never invent numbers or regulations."
-            )},
-            {"role": "user", "content": (
-                f"Decision: {decision}\n"
-                f"Default probability: {proba * 100:.1f}%\n"
-                f"Key factors: {factors_text}\n"
-                f"Compliance findings: {compliance_answer}"
-            )},
-        ],
-        temperature=0.2,
-    )
-    return completion.choices[0].message.content
+    try:
+        completion = llm_client.chat.completions.create(
+            model="meta-llama/Llama-3.3-70B-Instruct",
+            messages=[
+                {"role": "system", "content": (
+                    "You are a senior credit underwriting officer writing a short "
+                    "decision memo for a bank manager. Combine the risk assessment "
+                    "and compliance findings into 3-4 clear sentences. Use only the "
+                    "facts given below - never invent numbers or regulations."
+                )},
+                {"role": "user", "content": (
+                    f"Decision: {decision}\n"
+                    f"Default probability: {proba * 100:.1f}%\n"
+                    f"Key factors: {factors_text}\n"
+                    f"Compliance findings: {compliance_answer}"
+                )},
+            ],
+            temperature=0.2,
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        return f"LLM reporting failed: {e}"
 
 
 REQUIRED_APPLICANT_FIELDS = (
@@ -485,7 +605,8 @@ with st.expander("How this pipeline works (4 agents)", expanded=True):
         st.markdown("**4. Reporting Agent**")
         st.caption("Combines the three outputs above into one short, readable memo.")
 
-model, threshold = load_risk_model()
+# Load resources. For local development you can enable auto_create_dummy=True to create a small model.
+model, threshold = load_risk_model(auto_create_dummy=False)
 index, chunks, embed_model = load_compliance_resources()
 llm_client = load_llm_client()
 

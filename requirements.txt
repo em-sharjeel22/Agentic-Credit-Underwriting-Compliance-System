@@ -61,3 +61,4 @@ sentence-transformers
 huggingface_hub
 matplotlib
 python-dotenv
+torchvision
