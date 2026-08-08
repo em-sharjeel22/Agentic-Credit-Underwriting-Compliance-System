@@ -3,6 +3,11 @@ from typing import Dict, Any, List
 from constants import LLM_MODEL
 from utils.resources import load_compliance_resources
 from state import UnderwritingState
+import re
+import logging
+from typing import Dict, Any, List
+from constants import LLM_MODEL
+# ... (rest of your imports)
 
 # Configure standard logger
 logger = logging.getLogger(__name__)
@@ -42,9 +47,11 @@ def build_compliance_query(state: UnderwritingState) -> str:
         f"a consumer financing application with credit limit {credit_limit}?"
     )
 
+
+
 def compliance_agent(state: UnderwritingState) -> Dict[str, Any]:
     """
-    Agent responsible for checking SBP regulations using RAG.
+    Agent responsible for checking SBP regulations using Hybrid RAG (Regex + Vector).
     """
     logger.info("📖 [Compliance Agent] Checking SBP regulations...")
     
@@ -60,17 +67,33 @@ def compliance_agent(state: UnderwritingState) -> Dict[str, Any]:
         }
     
     try:
-        # Vector search using the globally loaded model and index
-        query_vector = EMBED_MODEL.encode([query], convert_to_numpy=True).astype("float32")
-        _, indices = INDEX.search(query_vector, 3)
+        retrieved = []
         
-        # Safely retrieve chunks (checking boundary conditions)
-        retrieved = [CHUNKS[i] for i in indices[0] if 0 <= i < len(CHUNKS)]
+        # 1. Check if the query is asking for a specific regulation (e.g., "R-1" or "O-5")
+        specific_reg_match = re.search(r'(Regulation|Reg)?\s*([R|O]-\d+)', query, re.IGNORECASE)
+
+        if specific_reg_match:
+            # 2. Extract the exact ID (e.g., "R-1")
+            reg_id = specific_reg_match.group(2).upper()
+            logger.info(f"Direct regulation lookup detected for: {reg_id}")
+            
+            # 3. Do an exact keyword match against the CHUNKS first
+            for chunk in CHUNKS:
+                if reg_id in chunk.get("section", "").upper():
+                    retrieved.append(chunk)
+
+        # 4. If exact match fails (or wasn't requested), fall back to Vector Search
+        if not retrieved:
+            query_vector = EMBED_MODEL.encode([query], convert_to_numpy=True).astype("float32")
+            _, indices = INDEX.search(query_vector, 5) # Increased to 5 for better semantic reach
+            retrieved = [CHUNKS[i] for i in indices[0] if 0 <= i < len(CHUNKS)]
+        
+        # 5. Format the retrieved chunks for the LLM
         context = "\n\n".join([f"[{c.get('section', 'Unknown')}]\n{c.get('text', '')}" for c in retrieved])
         sources = [c.get("section", "Unknown") for c in retrieved]
         
     except Exception as e:
-        logger.error(f"Vector search failed: {e}")
+        logger.error(f"Search failed: {e}")
         return {
             "compliance_question": query,
             "compliance_answer": "Error retrieving compliance documents.",
