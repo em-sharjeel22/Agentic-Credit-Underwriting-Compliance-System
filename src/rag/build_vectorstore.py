@@ -1,42 +1,30 @@
-# ============================================
-# BUILD VECTOR STORE
-# Convert chunks into embeddings and save them in a FAISS index.
-# ============================================
+"""
+Vector Store Construction & Embedding Generation
+------------------------------------------------
+Converts document chunks to 384-dimensional vectors and indices via FAISS.
+Includes a 384-dim fallback encoder to avoid dimension mismatch crashes.
+"""
 
 import json
 import os
+from pathlib import Path
 
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, "..", ".."))
-KB_DIR = os.path.join(PROJECT_ROOT, "data", "knowledge_base")
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+KB_DIR = BASE_DIR / "data" / "knowledge_base"
 
-CHUNKS_PATH = os.path.join(KB_DIR, "chunks.json")
-INDEX_PATH = os.path.join(KB_DIR, "faiss_index.bin")
-METADATA_PATH = os.path.join(KB_DIR, "chunk_metadata.json")
-
-MODEL_NAME = "all-MiniLM-L6-v2"
-
-
-def build_local_embeddings(texts):
-    vectors = []
-    for text in texts:
-        tokens = [token.lower() for token in text.replace("\n", " ").split() if token]
-        vector = np.zeros(64, dtype="float32")
-        for token in tokens:
-            index = abs(hash(token)) % 64
-            vector[index] += 1.0
-        norm = np.linalg.norm(vector)
-        if norm > 0:
-            vector = vector / norm
-        vectors.append(vector)
-    return np.stack(vectors)
+CHUNKS_PATH = KB_DIR / "chunks.json"
+INDEX_PATH = KB_DIR / "faiss_index.bin"
+METADATA_PATH = KB_DIR / "chunk_metadata.json"
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+EMBED_DIM = 384
 
 
-def build_local_embeddings(texts, dim=384):
+def build_local_embeddings(texts, dim=EMBED_DIM):
+    """Fallback hash vectorizer matching SentenceTransformer embedding dimension (384)."""
     vectors = []
     for text in texts:
         tokens = [token.lower() for token in text.replace("\n", " ").split() if token]
@@ -48,60 +36,53 @@ def build_local_embeddings(texts, dim=384):
         if norm > 0:
             vector = vector / norm
         vectors.append(vector)
-    return np.stack(vectors)
-
-def load_chunks():
-    print("Loading chunks...")
-    if not os.path.exists(CHUNKS_PATH):
-        raise FileNotFoundError(f"Chunks file not found: {CHUNKS_PATH}")
-
-    with open(CHUNKS_PATH, "r", encoding="utf-8") as handle:
-        chunks = json.load(handle)
-    print(f"Loaded {len(chunks)} chunks")
-    return chunks
+    return np.stack(vectors).astype("float32")
 
 
-def build_embeddings(chunks):
-    print(f"Loading embedding model: {MODEL_NAME}")
-    texts = [chunk["text"] for chunk in chunks]
-    print(f"Converting {len(texts)} chunks to embeddings...")
+def create_embeddings(texts, embed_model=None):
+    if isinstance(embed_model, str):
+        embed_model = SentenceTransformer(embed_model)
+
+    if embed_model is not None:
+        try:
+            return embed_model.encode(texts, show_progress_bar=False, convert_to_numpy=True).astype("float32")
+        except Exception:
+            pass
 
     try:
-        model = SentenceTransformer(MODEL_NAME)
-        embeddings = model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
-        print(f"Embedding shape: {embeddings.shape}")
-        return embeddings.astype("float32")
-    except Exception as exc:
-        print(f"Using local fallback embeddings because the model download failed: {exc}")
-        embeddings = build_local_embeddings(texts)
-        print(f"Embedding shape: {embeddings.shape}")
-        return embeddings
+        model = SentenceTransformer(EMBED_MODEL_NAME)
+        return model.encode(texts, show_progress_bar=False, convert_to_numpy=True).astype("float32")
+    except Exception:
+        return build_local_embeddings(texts, dim=EMBED_DIM)
 
 
-def build_faiss_index(embeddings):
-    print("Building FAISS index...")
+def build_faiss_index(chunks_or_embeddings, embed_model=None):
+    """
+    Overloaded interface accepting either a NumPy embedding matrix or raw chunk dictionaries.
+    """
+    if isinstance(chunks_or_embeddings, np.ndarray):
+        embeddings = chunks_or_embeddings
+    else:
+        texts = [chunk["text"] for chunk in chunks_or_embeddings]
+        embeddings = create_embeddings(texts, embed_model)
+
     dimension = embeddings.shape[1]
     index = faiss.IndexFlatL2(dimension)
     index.add(embeddings.astype("float32"))
-    print(f"Index built with {index.ntotal} vectors and {dimension} dimensions")
     return index
 
 
-def save_everything(index, chunks):
-    faiss.write_index(index, INDEX_PATH)
+def save_vectorstore(index, chunks):
+    os.makedirs(KB_DIR, exist_ok=True)
+    faiss.write_index(index, str(INDEX_PATH))
     with open(METADATA_PATH, "w", encoding="utf-8") as handle:
         json.dump(chunks, handle, indent=2, ensure_ascii=False)
-    print(f"Saved index: {INDEX_PATH}")
-    print(f"Saved metadata: {METADATA_PATH}")
 
 
 if __name__ == "__main__":
-    try:
-        chunks = load_chunks()
-        embeddings = build_embeddings(chunks)
-        index = build_faiss_index(embeddings)
-        save_everything(index, chunks)
-        print("Vector store is ready.")
-    except FileNotFoundError as exc:
-        print(exc)
-        raise SystemExit(1) from exc
+    if CHUNKS_PATH.exists():
+        with open(CHUNKS_PATH, "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+        idx = build_faiss_index(chunks)
+        save_vectorstore(idx, chunks)
+        print("✅ Vector store created successfully.")

@@ -1,7 +1,8 @@
-# ============================================
-# RAG DOCUMENT INGESTION
-# SBP Prudential Regulations for Consumer Financing
-# ============================================
+"""
+Document Ingestion & Sliding Window Chunking
+-------------------------------------------
+Ingests raw text and produces chunks with 200-char overlap to prevent text truncation.
+"""
 
 import re
 import json
@@ -14,37 +15,26 @@ KB_DIR.mkdir(parents=True, exist_ok=True)
 SOURCE_TXT_PATH = KB_DIR / "sbp_consumer_financing_source.txt"
 CHUNKS_PATH = KB_DIR / "chunks.json"
 
-SOURCE_URL = "https://www.sbp.org.pk/publications/prudential/PRs-Consumer.pdf"
 SOURCE_CITATION = (
     "State Bank of Pakistan. \"Prudential Regulations for Consumer Financing\" "
-    "(Updated August 03, 2016). Banking Policy & Regulations Department. "
-    f"{SOURCE_URL}"
+    "(Updated August 03, 2016). Banking Policy & Regulations Department."
 )
 
 
 def load_source_text(source_path=None):
     path = Path(source_path) if source_path else SOURCE_TXT_PATH
     if not path.exists():
-        raise FileNotFoundError(f"❌ Source file not found: {path}")
+        raise FileNotFoundError(f"Source file not found: {path}")
 
-    print(f"\n📂 Loading source text from: {path}")
-    print(f"📚 Source: {SOURCE_CITATION}")
     text = path.read_text(encoding="utf-8")
-
     if "PRUDENTIAL REGULATIONS \nFOR \nCONSUMER FINANCING" in text:
         text = text.split("PRUDENTIAL REGULATIONS \nFOR \nCONSUMER FINANCING", 1)[1]
-
-    print(f"✅ Loaded {len(text):,} characters")
     return text
 
 
-def chunk_by_regulation(text):
-    print("\n✂️  Chunking by regulation (sliding window method)...")
+def chunk_by_regulation(text, chunk_size=2000, overlap=200):
     parts = re.split(r'(REGULATION\s+[RO]-\d+)', text)
     chunks = []
-
-    chunk_size = 2000
-    overlap = 200
     step = chunk_size - overlap
 
     # 1. Process Intro / Definitions
@@ -59,7 +49,7 @@ def chunk_by_regulation(text):
                 "source": SOURCE_CITATION,
             })
 
-    # 2. Process Regulation Sections
+    # 2. Process Regulation Sections using Sliding Window
     for i in range(1, len(parts) - 1, 2):
         header = parts[i].strip()
         body = parts[i + 1].strip()
@@ -85,7 +75,6 @@ def chunk_by_regulation(text):
                     })
                     part_num += 1
 
-    print(f"✅ Created {len(chunks)} complete chunks without data loss.")
     return chunks
 
 
@@ -93,23 +82,21 @@ def save_chunks(chunks, destination_path=None):
     dest = Path(destination_path) if destination_path else CHUNKS_PATH
     with open(dest, "w", encoding="utf-8") as f:
         json.dump(chunks, f, indent=2, ensure_ascii=False)
-    print(f"💾 Saved → {dest}")
 
 
 def load_and_chunk_documents(source_dir=None):
-    """
-    Unified ingestion wrapper designed for rag_pipeline.py integration.
-    """
-    source_file = Path(source_dir) / "sbp_consumer_financing_source.txt" if source_dir else SOURCE_TXT_PATH
-    text = load_source_text(source_file)
+    if source_dir:
+        src = Path(source_dir)
+        source_path = src if src.is_file() else src / "sbp_consumer_financing_source.txt"
+    else:
+        source_path = SOURCE_TXT_PATH
+
+    text = load_source_text(source_path)
     chunks = chunk_by_regulation(text)
     save_chunks(chunks)
     return chunks
 
 
 if __name__ == "__main__":
-    try:
-        chunks = load_and_chunk_documents()
-        print(f"\n🎉 INGESTION COMPLETE! {len(chunks)} chunks ready.")
-    except Exception as exc:
-        print(f"❌ Ingestion failed: {exc}")
+    chunks = load_and_chunk_documents()
+    print(f"✅ Ingested {len(chunks)} chunks.")
