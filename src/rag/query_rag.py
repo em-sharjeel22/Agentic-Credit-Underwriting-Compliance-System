@@ -29,6 +29,11 @@ def build_local_query_vector(query):
         vector = vector / norm
     return vector
 
+def retrieve_context(question, index, chunks, model, top_k=3):
+    results = search(question, index, chunks, model, top_k=top_k)
+    context = "\n\n".join([f"[{r['section']}]\n{r['text']}" for r in results])
+    sources = [r['section'] for r in results]
+    return context, sources
 
 def load_vectorstore():
     if not os.path.exists(INDEX_PATH) or not os.path.exists(METADATA_PATH):

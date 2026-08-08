@@ -36,6 +36,20 @@ def build_local_embeddings(texts):
     return np.stack(vectors)
 
 
+def build_local_embeddings(texts, dim=384):
+    vectors = []
+    for text in texts:
+        tokens = [token.lower() for token in text.replace("\n", " ").split() if token]
+        vector = np.zeros(dim, dtype="float32")
+        for token in tokens:
+            idx = abs(hash(token)) % dim
+            vector[idx] += 1.0
+        norm = np.linalg.norm(vector)
+        if norm > 0:
+            vector = vector / norm
+        vectors.append(vector)
+    return np.stack(vectors)
+
 def load_chunks():
     print("Loading chunks...")
     if not os.path.exists(CHUNKS_PATH):
