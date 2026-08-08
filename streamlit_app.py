@@ -79,12 +79,25 @@ def get_groq_key():
 
 @st.cache_resource(show_spinner="Loading risk model...")
 def load_risk_model():
+    if not MODEL_PATH.exists():
+        st.error(
+            f"❌ **Model file not found** at `{MODEL_PATH}`.\n\n"
+            "Please ensure `credit_model.pkl` is committed and pushed to your GitHub repository "
+            "inside the `models/` folder, or generated during startup."
+        )
+        st.stop()
     bundle = joblib.load(MODEL_PATH)
     return bundle["model"], bundle["threshold"]
 
 
 @st.cache_resource(show_spinner="Loading compliance knowledge base...")
 def load_compliance_resources():
+    if not INDEX_PATH.exists() or not METADATA_PATH.exists():
+        st.warning(
+            f"⚠️ **Compliance knowledge base files not found** in `{KB_DIR}`.\n"
+            "Regulation search and automated compliance checks will be limited until the FAISS index and metadata are provided."
+        )
+        return None, [], None
     index = faiss.read_index(str(INDEX_PATH))
     with open(METADATA_PATH, "r", encoding="utf-8") as f:
         chunks = json.load(f)
@@ -101,10 +114,6 @@ def load_llm_client():
 
 
 # ── Agent logic ────────────────────────────────────────────
-# Kept self-contained in this file on purpose: importing from src/agents/
-# would add a cross-folder dependency that is fragile on a fresh cloud
-# checkout. Each function below plays the same role as the matching
-# agent in src/agents/orchestrator.py.
 
 def engineer_features(raw: dict) -> dict:
     """Turns the 23 raw fields into the same engineered features used at training time."""
@@ -154,8 +163,7 @@ def run_data_agent(raw: dict) -> dict:
 
 
 def run_risk_agent(model, threshold, applicant: dict):
-    """Scores the applicant and returns SHAP contributions computed natively by XGBoost
-    (via pred_contribs), which avoids the shap library's fragile model-format parser."""
+    """Scores the applicant and returns SHAP contributions computed natively by XGBoost."""
     feature_names = model.get_booster().feature_names
     if not feature_names:
         feature_names = list(pd.DataFrame([applicant]).columns)
@@ -182,15 +190,7 @@ def normalize_regulation_id(regulation_type: str, regulation_number: str) -> str
 
 
 def find_exact_regulation(query: str, chunks: list):
-    """Find an explicitly requested SBP regulation before semantic search.
-
-    Supports queries such as:
-    - R-3
-    - R3
-    - Regulation R-3?
-    - Explain regulation R3
-    - What is O-2?
-    """
+    """Find an explicitly requested SBP regulation before semantic search."""
     match = re.search(
         r"(?<![A-Z0-9])(?:REGULATION\s+)?([RO])\s*-?\s*(\d+)(?![A-Z0-9])",
         query.upper(),
@@ -201,12 +201,10 @@ def find_exact_regulation(query: str, chunks: list):
 
     requested_id = normalize_regulation_id(match.group(1), match.group(2))
 
-    # Prefer exact metadata ID if it exists.
     for chunk in chunks:
         if chunk.get("id", "").lower() == requested_id.lower().replace("regulation ", "regulation_").replace("-", "_"):
             return chunk
 
-    # Otherwise match the section heading exactly.
     for chunk in chunks:
         section = chunk.get("section", "").upper().strip()
         if section == requested_id or section.startswith(requested_id + ":"):
@@ -216,11 +214,10 @@ def find_exact_regulation(query: str, chunks: list):
 
 
 def retrieve_and_answer(query, index, chunks, embed_model, llm_client, top_k=3):
-    """Retrieve the relevant SBP regulation and explain it.
+    """Retrieve the relevant SBP regulation and explain it."""
+    if index is None or not chunks or embed_model is None:
+        return "Compliance knowledge base is not available.", []
 
-    Explicit regulation IDs use deterministic lookup first. Normal natural-
-    language questions continue to use semantic FAISS search.
-    """
     exact_chunk = find_exact_regulation(query, chunks)
 
     if exact_chunk is not None:
@@ -250,7 +247,6 @@ def retrieve_and_answer(query, index, chunks, embed_model, llm_client, top_k=3):
         for c in retrieved
     )
 
-    # Remove duplicate source names while preserving their retrieval order.
     sources = list(dict.fromkeys(
         c.get("section", "Unknown section") for c in retrieved
     ))
@@ -287,8 +283,7 @@ def retrieve_and_answer(query, index, chunks, embed_model, llm_client, top_k=3):
 
 
 def run_compliance_agent(index, chunks, embed_model, llm_client, applicant, decision, sbp_flags):
-    """Builds an applicant-specific compliance question, then delegates to
-    retrieve_and_answer for the actual retrieval + generation."""
+    """Builds an applicant-specific compliance question and retrieves the answer."""
     if sbp_flags.get("exceeds_r8_aggregate_cap"):
         query = (
             "What SBP regulation applies when a customer's aggregate clean "
@@ -308,9 +303,7 @@ def run_compliance_agent(index, chunks, embed_model, llm_client, applicant, deci
 
 
 def run_reporting_agent(llm_client, decision, proba, contributions, compliance_answer):
-    """Synthesizes the Risk Agent and Compliance Agent outputs into one polished,
-    human-readable underwriting memo. Uses only the facts already produced by
-    the other agents - it summarizes, it does not add new information."""
+    """Synthesizes the Risk Agent and Compliance Agent outputs into a decision memo."""
     if llm_client is None:
         return None
 
@@ -348,12 +341,7 @@ REQUIRED_APPLICANT_FIELDS = (
 
 
 def parse_applicant_from_text(description: str, llm_client):
-    """Gen AI feature: turns a free-text applicant description into the 23
-    structured fields the form needs, using the LLM to do the extraction.
-    This is a different use of the LLM than the RAG/synthesis agents above -
-    structured extraction rather than retrieval or summarization. Returns a
-    dict on success, or (None, error_message) on failure so the caller can
-    show a clear reason instead of silently doing nothing."""
+    """Turns a free-text applicant description into structured fields using LLM extraction."""
     if llm_client is None:
         return None, "LLM is not configured (missing GROQ_API_KEY)."
     if not description.strip():
@@ -400,7 +388,7 @@ def parse_applicant_from_text(description: str, llm_client):
 # ── Live chart builders ────────────────────────────────────
 
 def render_shap_chart(contributions):
-    """Bar chart of THIS applicant's top SHAP factors - recomputed on every submission."""
+    """Bar chart of top SHAP factors."""
     top = contributions[:8]
     labels = [f[0] for f in top][::-1]
     values = [f[1] for f in top][::-1]
@@ -416,18 +404,13 @@ def render_shap_chart(contributions):
 
 
 def verify_summary_citations(polished_summary: str, compliance_sources: list) -> bool:
-    """Lightweight hallucination guard: checks that every 'REGULATION X-N' the
-    polished memo cites was actually among the retrieved sources. This catches
-    the highest-stakes failure mode (inventing a compliance citation) even
-    though the summary step is only asked to rephrase, not add new facts."""
-    import re
+    """Lightweight hallucination guard for compliance citations."""
     cited = {c.upper() for c in re.findall(r"REGULATION\s+[RO]-\d+", polished_summary, re.IGNORECASE)}
     sources = {s.upper() for s in compliance_sources}
     return cited.issubset(sources)
 
 
 def payment_history_dataframe(applicant):
-    """Six-month bill/payment AMOUNT series built directly from the form inputs."""
     months = ["M-6", "M-5", "M-4", "M-3", "M-2", "M-1 (latest)"]
     bills = [applicant[f"BILL_AMT{i}"] for i in range(6, 0, -1)]
     payments = [applicant[f"PAY_AMT{i}"] for i in range(6, 0, -1)]
@@ -435,9 +418,6 @@ def payment_history_dataframe(applicant):
 
 
 def repayment_status_dataframe(applicant):
-    """Six-month repayment STATUS series - a different lens from the amounts
-    chart above: this shows behavior (on-time vs. months late), which is what
-    max_pay_delay and delay_trend are actually derived from."""
     months = ["M-6", "M-5", "M-4", "M-3", "M-2", "M-1 (latest)"]
     status = [
         applicant["PAY_6"], applicant["PAY_5"], applicant["PAY_4"],
@@ -447,8 +427,6 @@ def repayment_status_dataframe(applicant):
 
 
 def limit_vs_sbp_caps_dataframe(applicant):
-    """Where this applicant's requested limit sits relative to the two
-    SBP R-8 exposure caps - a compliance-context view."""
     return pd.DataFrame(
         {"Amount (PKR)": [applicant["LIMIT_BAL"], SBP_R8_PERSONAL_CLEAN_CAP, SBP_R8_AGGREGATE_CAP]},
         index=["Applicant's limit", "SBP clean cap (R-8)", "SBP aggregate cap (R-8)"],
@@ -456,8 +434,6 @@ def limit_vs_sbp_caps_dataframe(applicant):
 
 
 def applicant_summary_line(applicant):
-    """Human-readable summary using the same category labels shown in the
-    form - makes the categorical inputs legible instead of raw numeric codes."""
     sex = SEX_LABELS.get(applicant.get("SEX"), "Unknown")
     education = EDUCATION_LABELS.get(applicant.get("EDUCATION"), "Unknown")
     marriage = MARRIAGE_LABELS.get(applicant.get("MARRIAGE"), "Unknown")
@@ -466,9 +442,6 @@ def applicant_summary_line(applicant):
 
 
 def categorize_contributions(contributions):
-    """Groups the individual SHAP factors into the three FEATURE_CATEGORIES
-    and sums each category's net impact - a category can matter even when
-    no single feature inside it stands out on its own."""
     totals = {name: 0.0 for name in FEATURE_CATEGORIES}
     for feature, shap_value, _ in contributions:
         for category, members in FEATURE_CATEGORIES.items():
@@ -479,7 +452,6 @@ def categorize_contributions(contributions):
 
 
 def render_category_chart(category_totals):
-    """Bar chart of net risk impact per broad category, for THIS applicant."""
     labels = list(category_totals.keys())
     values = list(category_totals.values())
     colors = ["#d64545" if v > 0 else "#2f9e58" for v in values]
@@ -512,7 +484,6 @@ with st.expander("How this pipeline works (4 agents)", expanded=True):
     with p4:
         st.markdown("**4. Reporting Agent**")
         st.caption("Combines the three outputs above into one short, readable memo.")
-    st.caption("Data Agent → Risk Agent → Compliance Agent → Reporting Agent — each step's output feeds the next.")
 
 model, threshold = load_risk_model()
 index, chunks, embed_model = load_compliance_resources()
