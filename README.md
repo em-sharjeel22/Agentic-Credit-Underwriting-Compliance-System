@@ -5,6 +5,9 @@ system that combines **machine learning, explainable AI,
 Retrieval-Augmented Generation (RAG), and LLM-based agents** to evaluate
 consumer financing applications.
 
+* **GitHub Repository:** [em-sharjeel22/Agentic-Credit-Underwriting-Compliance-System](https://github.com/em-sharjeel22/Agentic-Credit-Underwriting-Compliance-System)
+* **Live Streamlit App:** [Access Streamlit UI](https://agentic-credit-underwriting-compliance-system-bympbc8ykiuewtr9.streamlit.app/)
+
 The system performs live applicant risk assessment, explains model
 decisions using XGBoost feature contributions, checks relevant SBP
 Prudential Regulations for Consumer Financing, and generates an
