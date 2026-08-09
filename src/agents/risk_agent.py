@@ -1,6 +1,6 @@
 import pandas as pd
 import xgboost as xgb
-from resources import load_risk_resources
+from utils.resources import load_risk_resources
 from state import UnderwritingState
 def risk_agent(state: UnderwritingState) -> dict:
     print("🔍 [Risk Agent] Analyzing applicant...")

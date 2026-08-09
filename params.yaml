@@ -1,0 +1,9 @@
+prepare:
+  sample_frac: 1.0
+
+eda:
+  hist_bins: 30
+
+genai:
+  model: "your-model-name"
+  max_tokens: 512
